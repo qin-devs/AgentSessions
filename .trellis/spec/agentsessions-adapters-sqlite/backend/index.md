@@ -56,6 +56,13 @@ are derived and must be fully rebuildable from `catalog` at any time.**
   never by comparing their raw BM25 scores. SQLite FTS5
   auxiliary functions and `MATCH` name the real virtual table (`fts`), not a
   table alias.
+- Filtered hit ownership is occurrence-aware: repo, provider and applicable
+  sidechain predicates must hold on the same placement. Select the smallest
+  matching Session wire ID deterministically and return it with lexical and
+  semantic hits so hybrid/grouping/display do not fall back to an unrelated
+  compatibility alias. Metadata representatives must satisfy the same placement
+  predicates. Preserve MainOnly's existing message-wide exclusion of any
+  sidechain history; this ownership correction does not redefine that facet.
 - `ContextGraphStore` reads — return typed Domain messages/documents/placements/
   edges, group reverse candidates by distinct Session, and expose aggregate
   placement/claim counts. They never return SQL rows or compatibility JSON.
@@ -73,7 +80,7 @@ instead of rejecting the batch. Which fields may differ is deliberately narrow:
 | Entity | Unioned fields | Everything else |
 |---|---|---|
 | Session | `messages` (append-order), `documents` (sorted) | fields not in the union set (`document`, `documents`, `messages`) are not preserved by the merge |
-| Message | contextual compatibility keys (`session(s)`, `span(s)`, parent provenance, sidechain, seq) | stable role/text and unknown intrinsic fields must match; timestamp has one deliberate exception (below) |
+| Message | contextual compatibility keys (`session(s)`, `span(s)`, parent provenance, sidechain, seq); text uses the existing deterministic longer-projection rule | stable role and unknown intrinsic fields must match across live sources; timestamp has only the deliberate compatibility exceptions below |
 
 - **Timestamp exception (Codex)**: `timestamp` may differ as `string` vs `null`
   across projections of the same stable message — the old Codex adapter stored
@@ -82,22 +89,57 @@ instead of rejecting the batch. Which fields may differ is deliberately narrow:
   merged value converges deterministically on `null` regardless of merge
   order (no stable timestamp exists for the entity).
 
+- **Timestamp spelling exception (Cursor ItemTable)**: the same proven
+  millisecond instant may arrive as an old decimal string and a new UTC string
+  during parser-version re-ingestion. This is allowed only for final claimants
+  whose own associated Document observation proves provider `cursor` and variant
+  `cursor/vscdb-chat-v1`. See the rolling-upgrade scenario below; the generic
+  pairwise merge and other providers are not broadened.
+
 - Each unioned field keeps a **singular alias** (`document`, `session`, `span`)
   holding the first entry, so readers written against the pre-union shape keep
   working. On a shared entity the alias names *one* contributor, not all of
   them — treat it as a compatibility shim, never as the complete answer.
-- The merge starts from **the value already in the catalog**, not just from the
-  other source in the current batch. Without that, syncing a corpus in several
-  invocations would let each batch overwrite the previous batch's members.
-- Identical stored bytes skip the merge entirely. That keeps an unchanged
-  re-sync a content-level no-op and avoids forcing slice-era opaque payloads
-  through a JSON parse.
-- Once every known contributing source is relation-complete, compatibility
+- Schema 19 retains original observations in `source_entity_projections`, keyed
+  by source and entity. A complete scan replaces that source's observations;
+  an incomplete scan updates observed entries but retains unobserved evidence.
+  Aggregate payloads are recomputed from final live claimants, not folded with
+  historical aggregate text. Thus a same-source shorter/equal-length correction
+  replaces its predecessor, while cross-source reconciliation remains deterministic.
+- Migration creates an empty evidence table: missing legacy evidence stays
+  unknown. Preserve an existing aggregate until every live claimant has actual
+  observations; if no aggregate exists to preserve, fail with re-ingest guidance.
+  Parser version 4 introduced this re-ingestion; current version 5 also reparses
+  unchanged sources for timestamp/BOM fidelity. Re-ingesting all contributors
+  supplies evidence and converges; never manufacture per-source payloads from
+  the historical aggregate.
+- Both no-op checks include original identity/payload/text evidence. Evidence
+  changes must commit even when the aggregate does not change, since a later
+  source deletion may reveal that observation.
+- Once every known contributing source is relation-complete and has evidence, compatibility
   aliases are regenerated subtractively from placements/edges/claims:
   divergent parents/sidechain values become `null`, spans name exact placement
   and document identities, and zero-message Session documents survive through
   source entity membership. Mixed legacy/incomplete state preserves existing
   aliases and never pretends they are complete.
+- Alias candidates include memberships/placements from both before and after
+  source replacement, including entities retained only by another source. Keep
+  all candidate/evidence loads batch-scoped. Relocation moves the new table's
+  live source locator alongside existing source tables.
+- Incomplete scans preserve existing compatibility aliases while allowing
+  observed intrinsic payload corrections. An unobserved raw projection must not
+  overwrite previously generated spans/parents/session aliases. No-op probes
+  compare authoritative state without treating a retained legacy aggregate as a
+  live original claimant; intrinsic corrections can repeat and later converge.
+- Unscoped public writes (`put`, ordinary batch and index-batch APIs) reject
+  IDs claimed by source membership, including unscoped deletions. Use source
+  replacement to change those facts. Validate before creating intent and again
+  at public commit boundaries; standalone unclaimed entities remain writable.
+- Source manifest descriptors retain full typed identity and labeled BLAKE3
+  payload/text digests, not JSON numeric arrays or another copy of transcript
+  bodies. Original bytes remain in the projection table. Reuse the one sealed
+  canonical manifest during private phase-2 verification; CAS and persisted
+  durable-manifest comparisons remain mandatory.
 
 ## SQLite v7 relation commit
 
@@ -121,8 +163,11 @@ instead of rejecting the batch. Which fields may differ is deliberately narrow:
   metadata against persisted `fts_ids.id_json` before taking a no-op shortcut
   or creating an outbox intent. A cross-batch metadata conflict fails without
   changing generation, claims, catalog, or index state.
-- FTS rebuild touches only `fts`/`fts_ids`; relation rows, claims, completeness,
-  context graphs, and aggregate context stats must remain byte-for-byte stable.
+- FTS rebuild reprojects `fts`/`fts_ids` and removes historical vector rows
+  with no catalog entity inside its writer transaction. Live vectors remain;
+  relation rows, claims, completeness, context graphs and aggregate context
+  stats must remain byte-for-byte stable. This does not repair stale-but-live
+  legacy vectors; those require `index embeddings`.
 - Context reads fail `SchemaIncompatible` with a bounded re-ingest action when
   any known contributor lacks a v7 completeness marker. They never parse
   compatibility aliases as graph authority.
@@ -525,3 +570,106 @@ Reconstructed sidecar label is sufficient on its own.
 ---
 
 **Language**: All documentation in **English**.
+
+## Scenario: Complete SQLite source signature reads
+
+### 1. Scope / Trigger
+Classifying a source before choosing ordinary byte fingerprinting or a logical SQLite/WAL snapshot.
+
+### 2. Signatures
+`source_fs::capture(&Path) -> PortResult<SourceSnapshot>` uses the private `has_sqlite_header(&mut dyn Read)` classifier.
+
+### 3. Contracts
+Read exactly 16 signature bytes or observe definite EOF. A successful short Read is not EOF and cannot decide the format. Classification must not consume payload bytes beyond the header. Existing logical backup and read-only source guarantees remain unchanged.
+
+### 4. Validation & Error Matrix
+Exact SQLite signature -> logical backup; short file/nonmatching signature -> ordinary file; other I/O error -> SourceIo. Do not downgrade a real I/O error into a text-file classification.
+
+### 5. Good/Base/Bad Cases
+Good: one-byte chunks still identify SQLite. Base: empty/short text is a regular file. Bad: one short read skips committed WAL data.
+
+### 6. Tests Required
+`source_fs` tests cover chunks 1..16, EOF/nonmatch, error after partial input and the existing WAL-only change/source-immutability regression.
+
+### 7. Wrong vs Correct
+Wrong: classify from one read's byte count. Correct: `read_exact` with explicit UnexpectedEof handling and other errors propagated.
+
+## Scenario: Pinned SQLite request views
+1. **Scope:** multi-read requests on one SqliteStore, including write-open stores used for tests/composition.
+2. **Signature:** `begin_read_snapshot() -> PortResult<Box<dyn ReadSnapshot + '_>>` implements the catalog port.
+3. **Contract:** first guard starts a deferred transaction and reads store_metadata before returning; BEGIN or SELECT 1 alone is insufficient. Nested guards share a counter without retaining a RefCell borrow. query_only refuses writes within the scope. Constructors leave query_only OFF; the private connection is not externally configurable. Final guard rolls back and restores OFF without changing SQLite open flags or migrating schema.
+4. **Errors:** do not join an unrelated active transaction. Failed pin cleans up; failed rollback/reset poisons subsequent snapshot acquisition with a reopen-required backend error. Drop cannot return a cleanup error for the current response; it must not panic during unwinding.
+5. **Cases:** concurrent WAL commit is invisible to the current view and visible to the next. Read-only source/catalog permissions stay unchanged.
+6. **Tests:** writer before query and before payload/ownership, eager pin, non-LIFO nesting, early error/unwind, failed pin, write refusal and cleanup poisoning.
+7. **Wrong/right:** a process mutex cannot provide cross-process consistency; one pinned connection shared by every request data port can.
+
+## Scenario: Dimension-aware vector validity
+1. **Scope:** semantic/hybrid reads, canonical body updates, and explicit index maintenance.
+2. **Signatures:** `SemanticIndex::is_ready(query_dimension: usize)`; private `message_body`, `invalidate_changed_vectors_in_tx`; existing `rebuild_index`/`index embeddings` maintenance.
+3. **Contracts:** readiness checks selected model, query dimension and live catalog within the request snapshot. Invalidation compares complete canonical message bodies, not the FTS-capped projection, on both `put` and batch/source write paths. Unchanged body/alias-only updates preserve valid vectors. Index rebuild removes only historical orphans; reads never prune.
+4. **Errors:** corruption in a matching vector and backend failures propagate; only an actual not-ready result permits explicit lexical fallback. Invalidations/pruning roll back together with catalog/index/generation on failure.
+5. **Cases:** a body change beyond the FTS cap still retires a vector; wrong-dimension-only vectors do not make an index ready. Live legacy vectors may be stale and require explicit embedding rebuild; do not promise automatic historical repair.
+6. **Tests:** model/dimension/live-row matrix; malformed matching vector; put plus every public batch/source path; unchanged-body retention; transaction rollback; read-only orphan retention and writer rebuild cleanup; WAL writer between readiness/query/payload.
+7. **Wrong/right:** comparing capped FTS text misses changes used by the vectorizer; compare full input and keep the original FTS cap unchanged. No schema or parser bump is required for these derived-cache corrections.
+
+
+## Scenario: Cursor ItemTable timestamp rolling upgrade
+
+### 1. Scope / Trigger
+Parser 5 can replace a decimal millisecond string with a UTC string while an
+unscanned copy still claims the same Message. Source replacement, not a schema
+migration or a read, reconciles this representation-only change. Schema stays 19.
+
+### 2. Signatures
+`commit_source_batches_if_changed(&[SourceBatch]) -> PortResult<bool>`;
+`cursor_itemtable_timestamp_alias(...) -> PortResult<Option<String>>` and
+`cursor_aggregate_payload(...) -> PortResult<Cow<[u8]>>` are private helpers.
+`source_membership.document_id` selects the proving Document in that source's
+`source_entity_projections`, never in the merged catalog payload.
+
+### 3. Contracts
+- Every final claimant must have an associated Document observation naming
+  `cursor` / `cursor/vscdb-chat-v1`. A correct but unrelated Document does not
+  authorize reinterpretation. Load referenced proofs outside aggregate candidates
+  in a batch-scoped query; do not expand the merge set or scan the whole catalog.
+- Compare all non-null original timestamp observations before pairwise folding.
+  Interpret only this proven old spelling as signed i64 Unix milliseconds and
+  compare the complete `(unix_seconds, nanosecond)` tuple to parsed date-times.
+  Do not round to milliseconds, guess units by digit count, or let null hide a
+  non-null disagreement within the proven ItemTable set.
+- Use an actually observed UTC/offset spelling only while aggregating. Never
+  mutate `SourceReplacementManifest.projections`, original payload/text evidence,
+  identity, or exact no-op comparisons. Null still converges to null.
+- Recompute from final surviving observations: removing the sole date-time
+  claimant restores the remaining decimal spelling; an incomplete scan does not
+  remove that claimant. Generic role/unknown intrinsic conflicts stay strict.
+- Parser-version rollback is not an inverse data migration. Do not merely lower
+  markers; restore a matching catalog backup or re-ingest into a fresh catalog
+  with the chosen compatible binary before a semantic downgrade. `index rebuild`
+  alone does not reparse original provider sources.
+
+### 4. Validation & Error Matrix
+Missing/wrong provenance does not authorize the exception. Different instants,
+unsupported proven observations, and other intrinsic conflicts remain bounded
+`PortError::Backend` failures; no generation, catalog or original observation
+changes commit. Missing legacy source evidence keeps the existing schema-19
+re-ingestion policy rather than fabricating proof.
+
+### 5. Good / Base / Bad Cases
+Good: `1000` and `1970-01-01T01:00:01.000+01:00` under proven ItemTable claims.
+Base: one live decimal claimant retains its original spelling.
+Bad: `1000`, null and `1970-01-01T00:00:01.000000001Z` must not be silently folded.
+
+### 6. Tests Required
+The `cursor_timestamp_upgrade_*` storage tests cover both replacement orders,
+1-nanosecond differences, three-source null folding, per-claimant association,
+unrelated/wrong/missing Document proof, source removal versus incomplete scans,
+raw evidence equality, no-op behavior and other intrinsic fields. CLI tests must
+also exercise identical snapshot copies, stable IDs, parser-4 to parser-5
+re-ingestion and unchanged source bytes.
+
+### 7. Wrong vs Correct
+Wrong: normalize timestamps globally in `merge_message_payloads` or overwrite
+old source observations to make them compare equal.
+Correct: prove the variant per claimant, compare exact instants first, then use
+a temporary aggregate-only alias that disappears with its last live claimant.

@@ -1,0 +1,9 @@
+{"file": ".trellis/spec/agentsessions-provider-codex/backend/index.md", "reason": "Package contracts"}
+{"file": ".trellis/tasks/10-02-global-review-remediation/design.md", "reason": "Approved decisions and scopes"}
+{"file": ".trellis/tasks/10-02-global-review-remediation/research/baseline.md", "reason": "Fixed baseline and upstream work"}
+{"file": ".trellis/spec/agentsessions-ports/backend/index.md", "reason": "Provider event, timestamp, identity and loss-report contracts"}
+{"file": ".trellis/spec/agentsessions-testkit/backend/index.md", "reason": "Synthetic golden fixture and regression contracts"}
+{"file": "crates/agent-session-grep-provider-cursor/tests/golden/PROVENANCE.md", "reason": "Existing Cursor variants and pinned format evidence"}
+{"file": "crates/agent-session-grep-provider-cline/tests/golden/PROVENANCE.md", "reason": "Cline single-document fixture and timestamp conventions"}
+{"file": ".trellis/spec/agentsessions-adapters-sqlite/backend/index.md", "reason": "Provenance-gated timestamp rolling upgrade and raw source evidence"}
+{"file": ".trellis/spec/agentsessions-cli/backend/index.md", "reason": "CLI timestamp filters, parser reparse and fixture matrix integration"}

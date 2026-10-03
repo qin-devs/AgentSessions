@@ -156,3 +156,94 @@ shipped Cursor 版本的兼容性认证，也不授权 resume。
   既有 capture 路径写入读标记；adapter 本身从不打开源文件，只在私有副本上单次固定
   读事务（证据：`source_database_files_stay_byte_identical_across_a_concurrent_wal_commit`、
   `tests/disk_kv_golden.rs::probe_and_parse_never_mutate_the_received_snapshot_bytes`）。
+
+
+---
+
+## `timestamps.json` — P1-2 timestamp regression (revision 1, 2026-10-03)
+
+### Construction and scope
+
+This is a new, entirely synthetic JSON fixture of SQLite row payloads, not a
+capture or redaction of a real database. `tests/timestamps.rs::database` creates
+an in-memory `ItemTable` or `cursorDiskKV`, inserts the selected fixture rows,
+and materializes a temporary SQLite snapshot with `VACUUM INTO`. The test owns
+and removes only that generated file. No source corpus is opened or modified.
+The fixture's `fixture_revision` is 1; the existing provider maturity and
+manifest fixture revision are unchanged.
+
+The fixed epoch anchor is `1704067200123` milliseconds
+(`2024-01-01T00:00:00.123Z`). The values one millisecond before and after it
+pin the precision needed for half-open `[since, until)` filters. Values -1, 0
+and 1 pin the unit independently of magnitude and the pre-epoch remainder.
+Missing/null fields remain absent. The disk-kv fixture adds an offset timestamp
+with nine fractional digits, repeated header references, out-of-time-order
+headers, and a composer timestamp that must never supply missing bubble time.
+All IDs and text are invented, including the Unicode/whitespace sentinel.
+Invalid-type and out-of-range cases are generated synthetically in the test.
+
+`basic.db`, `disk-kv.db`, and `disk-kv-shuffled.db` are not regenerated or changed.
+The old ItemTable golden projection is corrected only for its timestamp strings;
+source hashes, text, ordering, identity and accounting stay the same.
+
+### Revalidated primary implementation evidence
+
+These are pinned implementations of a private format, not official Cursor
+schemas or a compatibility certification. Only format facts are reused; no
+implementation or fixture bytes are copied.
+
+* **ItemTable milliseconds:** `byteowlz/hstry` (MIT), commit
+  `af32c07c5baf190105c1cd39530bcab25d464595`,
+  `adapters/cursor/adapter.ts`, L544-L562 assigns bubble
+  `timingInfo.startTime` directly to message `createdAt`; L595-L609 does the
+  same for both messages of an `aiService.prompts` exchange. L671-L674 renders
+  this message field with `new Date(msg.createdAt).toISOString()`, establishing
+  milliseconds, not seconds. Tab `createdAt` remains an ordering observation,
+  not a replacement for missing message time.
+* **disk-kv bubble strings:** the already-pinned Wake commit
+  `71aeca67ec80f8645d1f9d5199290c2c732036ce`,
+  `crates/wake-core/src/adapters/cursor_ide.rs`, L466-L470 reads bubble
+  `createdAt` as a string and sends it to `iso_ms`. Composer numeric
+  `createdAt`/`lastUpdatedAt` are separate session metadata (L578-L579).
+* **Independent field distinction:** `skillsynchq/txcript` (Apache-2.0), commit
+  `8a20761fc57e5d5201cc4f52f28cebef541a8049`,
+  `docs/formats/cursor-desktop.md`, L75-L78 distinguishes composer epoch
+  milliseconds from bubble RFC3339 `createdAt`.
+  `src/harness/cursor_desktop.rs`, L196-L201 accepts only string bubble
+  timestamps for RFC3339 parsing; its writer emits bubble ISO strings at
+  L618-L620 and composer epoch milliseconds at L645-L646/L673-L676.
+
+The hstry composer helper `toMilliseconds` (L320-L331) uses a magnitude
+heuristic. It is deliberately **not** unit evidence and is not reused.
+There is no proven numeric-seconds or numeric-milliseconds bubble alternative
+in the pinned disk-kv evidence above. Numeric bubble `createdAt` therefore
+must not be interpreted as either unit, and composer time must not be copied
+to messages as a fallback.
+
+### Parser boundary and remaining integration limits
+
+ItemTable integer epochs become UTC strings with exact millisecond precision
+in the formatter's four-digit year range (0000 through 9999); values outside
+that range retain the message but omit its timestamp with a diagnostic.
+Raw epoch integers still control the existing sort, so formatting or omission
+of an out-of-range timestamp does not reorder, drop or re-identify messages.
+Unsupported ItemTable JSON field types retain the existing recoverable
+whole-value parse failure; no numeric value is converted to an empty string.
+
+Disk-kv source timestamp strings are preserved verbatim under the generic
+`MessageEvent.timestamp` contract, including timezone and fractional spelling;
+this change is not a new calendar validator. Missing/null time stays absent.
+Unsupported JSON types and empty/whitespace-only strings yield no timestamp
+and a field-loss diagnostic, not a skipped message or a guessed instant.
+The existing header traversal, storage-key identity, body/role/tool handling,
+slot counts, source bounds and temporary-database behavior are unchanged.
+
+Provider tests pin the emitted representations; CLI filtering and parser-version
+re-ingestion are owned by the main session. A migration caveat remains: Cursor
+emits no native message ID, but two sources with identical snapshot fingerprints
+share document-scoped message IDs (`provider + variant + document + seq`).
+Timestamps do not participate in those IDs. Sequentially reprocessing two old,
+identical ItemTable snapshots can therefore compare an old raw numeric string
+with its new UTC spelling under the same message ID; integration must exercise
+that cross-source intrinsic-conflict boundary rather than assuming that empty
+native IDs make it impossible.

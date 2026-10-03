@@ -512,6 +512,7 @@ fn stream_frame(
     message: &str,
     request_id: Option<&str>,
 ) -> String {
+    let (message, _) = crate::redaction::redact_text(message);
     json!({
         "schema_version": SCHEMA_VERSION,
         "frame_type": frame_type,
@@ -665,6 +666,50 @@ mod tests {
         assert_eq!(e.message, "提供方源文件读取失败");
         assert!(!e.message.contains("secret"));
         assert!(!e.message.contains("transcript.jsonl"));
+    }
+
+    #[test]
+    fn boundary_stream_frames_redact_message_not_request_id() {
+        let secret = "sk_live_abcdef1234567890xyz";
+        for text in [
+            progress_frame("ingest", secret, Some(secret)),
+            diagnostic_frame("ingest", secret, Some(secret)),
+        ] {
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(frame["request_id"], secret);
+            assert_eq!(frame["command"], "ingest");
+            assert_eq!(frame["message"], "[redacted:stripe_key]");
+        }
+    }
+
+    #[test]
+    fn boundary_envelopes_preserve_correlation_cursor_and_stable_ids() {
+        let correlation = "sk_live_abcdef1234567890xyz";
+        let id = "ses_v1_native-123";
+        let page = Page {
+            next_cursor: Some(correlation.into()),
+            has_more: true,
+        };
+        let text = success_envelope(
+            "list",
+            Outcome::Success,
+            json!({"session_id": id}),
+            0,
+            &page,
+            &[],
+            Some(correlation),
+            RetrievalMode::default(),
+            &RedactionStatus::default(),
+        );
+        let frame: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(frame["request_id"], correlation);
+        assert_eq!(frame["page"]["next_cursor"], correlation);
+        assert_eq!(frame["data"]["session_id"], id);
+        let error = ProtocolError::new(CanonicalCode::InvalidRequest, correlation);
+        let frame: Value =
+            serde_json::from_str(&error_envelope("search", &error, Some(correlation))).unwrap();
+        assert_eq!(frame["request_id"], correlation);
+        assert_eq!(frame["error"]["message"], "[redacted:stripe_key]");
     }
 
     #[test]

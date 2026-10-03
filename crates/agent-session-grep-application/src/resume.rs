@@ -9,6 +9,7 @@
 //! spawn is deferred to the execution layer (requires owner authorization per
 //! CLAUDE.md). Handoff pack (#4) only consumes the descriptor, never executes.
 
+use agent_session_grep_domain::{IdKind, StableId};
 use agent_session_grep_ports::SessionResumeMetadata;
 
 /// Provider resume command descriptor: the command + args + cwd + permission
@@ -64,10 +65,13 @@ pub fn build_resume_descriptor(metadata: &SessionResumeMetadata) -> ResumePrevie
     let provider_id = metadata.provider_id.as_deref().unwrap_or("");
     let session_id = metadata.provider_session_id.as_deref().unwrap_or("");
 
-    // Fail-closed 边界（audit P1-2）：`resume_available=true` 但 provider
-    // session id 缺失/空白时，已知 provider 也会造出空 SID 命令
-    // （`claude --resume ""`）——必须降级为不可用 + 原因，绝不生成空命令。
-    if session_id.trim().is_empty() {
+    // Use the checked identity contract for both preview and execution.
+    // An argv operand starting with a hyphen can still be parsed as an option.
+    let missing_session_id = session_id.trim().is_empty();
+    if missing_session_id
+        || session_id.starts_with('-')
+        || StableId::native_checked(IdKind::Session, session_id).is_err()
+    {
         return ResumePreview {
             descriptor: ResumeDescriptor {
                 provider_binary: String::new(),
@@ -78,7 +82,12 @@ pub fn build_resume_descriptor(metadata: &SessionResumeMetadata) -> ResumePrevie
             command_string: String::new(),
             available: false,
             unavailable_reason: Some(
-                "resume metadata is missing the provider session id".to_string(),
+                if missing_session_id {
+                    "resume metadata is missing the provider session id"
+                } else {
+                    "resume metadata contains an invalid provider session id"
+                }
+                .to_string(),
             ),
         };
     }
@@ -334,6 +343,61 @@ mod tests {
             } else {
                 None
             },
+        }
+    }
+
+    #[test]
+    fn boundary_resume_rejects_option_like_and_unchecked_native_ids() {
+        let invalid = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "--".to_string(),
+            "-h".to_string(),
+            "id with space".to_string(),
+            " id".to_string(),
+            String::from_utf8(vec![97, 0, 98]).unwrap(),
+            "x".repeat(257),
+        ];
+        for provider in [
+            "claude-code",
+            "codex",
+            "pi",
+            "grok-build",
+            "antigravity",
+            "opencode",
+            "kimi-code",
+            "tencent-codebuddy",
+        ] {
+            for native_id in &invalid {
+                let preview = build_resume_descriptor(&metadata(provider, true, native_id, None));
+                assert!(!preview.available, "{provider}: {native_id:?}");
+                assert!(preview.command_string.is_empty());
+                assert!(preview.descriptor.provider_binary.is_empty());
+                assert!(preview.descriptor.args.is_empty());
+                assert!(preview.unavailable_reason.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_resume_preserves_valid_native_ids_and_preview_quoting() {
+        for native_id in ["abc-123", "part_1:2.3", "会话-1", "a;b"] {
+            let preview = build_resume_descriptor(&metadata(
+                "claude-code",
+                true,
+                native_id,
+                Some("C:/work space"),
+            ));
+            assert!(preview.available);
+            assert_eq!(preview.descriptor.args, ["--resume", native_id]);
+            assert!(
+                preview
+                    .command_string
+                    .starts_with("(cd \"C:/work space\" && ")
+            );
+            if native_id == "a;b" {
+                assert!(preview.command_string.contains("\"a;b\""));
+            }
+            assert_eq!(preview.descriptor.permission_mode, None);
         }
     }
 

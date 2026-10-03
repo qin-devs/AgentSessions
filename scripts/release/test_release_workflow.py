@@ -52,6 +52,37 @@ class WorkflowContractTests(unittest.TestCase):
                     unpinned.append(f"{path.name}:{number}: {reference}")
         self.assertEqual(unpinned, [], f"unpinned action references: {unpinned}")
 
+    def job(self, text: str, name: str) -> str:
+        match = re.search(rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  [a-z_-]+:|\Z)", text)
+        self.assertIsNotNone(match, f"missing job {name}")
+        return match.group(1)
+
+    def test_release_quality_and_build_share_resolved_source_commit(self) -> None:
+        text = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
+        quality = self.job(text, "quality")
+        self.assertIn("needs: prepare", quality)
+        self.assertIn("source_commit: ${{ needs.prepare.outputs.source_commit }}", quality)
+        for name in ("build", "assemble"):
+            with self.subTest(job=name):
+                job = self.job(text, name)
+                self.assertIn("ref: ${{ needs.prepare.outputs.source_commit }}", job)
+                self.assertNotIn("ref: ${{ needs.prepare.outputs.tag }}", job)
+
+    def test_reusable_ci_checks_the_requested_immutable_source(self) -> None:
+        text = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("      source_commit:", text)
+        source = self.job(text, "source")
+        self.assertIn("inputs.source_commit || github.sha", source)
+        self.assertIn("^[0-9a-f]{40}$", source)
+        for name in ("test", "installer", "deny", "msrv"):
+            with self.subTest(job=name):
+                job = self.job(text, name)
+                self.assertIn("needs: source", job)
+                self.assertIn("ref: ${{ needs.source.outputs.commit }}", job)
+        msrv = self.job(text, "msrv")
+        self.assertIn('toolchain: "1.90.0"', msrv)
+        self.assertIn("cargo +1.90.0 check --workspace --all-targets --all-features --locked", msrv)
+
     def test_gh_steps_declare_the_repository_they_act_on(self) -> None:
         """`gh` resolves its repository from a git remote, `GH_REPO`, or
         `--repo`; it never falls back to `GITHUB_REPOSITORY`."""

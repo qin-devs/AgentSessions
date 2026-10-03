@@ -10,7 +10,7 @@
     "second-noop"
   ],
   "dataset": {
-    "path": "C:\\AgentSessions-worktrees\\post-reuse-phase\\target\\index-throughput\\corpus-10k-equiv",
+    "path": "<repo>\\target\\index-throughput\\corpus-10k-equiv",
     "method": "sha256(sorted(relative_posix_path + NUL + file_bytes + NUL))",
     "sha256": "c50db4123b248fcc3d736e445089c233ccff7a530456a054f4e1bd35c73707c8",
     "file_count": 2,
@@ -18,11 +18,11 @@
   },
   "binaries": {
     "a": {
-      "path": "C:\\AgentSessions-worktrees\\post-reuse-phase\\target\\index-throughput\\baseline-target\\release\\agent-session-grep.exe",
+      "path": "<repo>\\target\\index-throughput\\baseline-target\\release\\agent-session-grep.exe",
       "sha256": "664c2e7bf035c1fc88f956df03345449a024ba2e3f7cf33c407658b9cc95c4fc"
     },
     "b": {
-      "path": "C:\\AgentSessions-worktrees\\post-reuse-phase\\target\\release\\agent-session-grep.exe",
+      "path": "<repo>\\target\\release\\agent-session-grep.exe",
       "sha256": "3e55a4c42ac49ffde50e43a895e79b35df30cf73cddfed057a706783f740e835"
     }
   },

@@ -261,3 +261,109 @@ fn a_broken_bubble_does_not_discard_its_session() {
     let frame = parse_first_line(&search);
     assert_eq!(hit_sessions(&frame).len(), 1, "{frame}");
 }
+
+#[test]
+fn disk_kv_timestamp_filters_preserve_offsets_and_nanosecond_precision() {
+    let (dir, db) = temp_db("cursor-disk-kv-timestamps");
+    let source = dir.path().join("workspace/state.vscdb");
+    let records = [
+        (
+            "after",
+            "diskkvprecision after",
+            "2025-01-01T00:00:00.123456790Z",
+        ),
+        (
+            "before",
+            "diskkvprecision before",
+            "2025-01-01T01:00:00.123456788+01:00",
+        ),
+        (
+            "exact",
+            "diskkvprecision exact",
+            "2025-01-01T01:00:00.123456789+01:00",
+        ),
+    ];
+    write_state_vscdb(
+        &source,
+        &[Composer {
+            id: "time-composer",
+            headers: records
+                .iter()
+                .map(|(id, _, _)| serde_json::json!({"bubbleId":id,"type":USER}))
+                .collect(),
+            bodies: records
+                .iter()
+                .map(|(id, text, timestamp)| {
+                    (
+                        *id,
+                        Some(serde_json::json!({"text":text,"createdAt":timestamp})),
+                    )
+                })
+                .collect(),
+        }],
+    );
+    let original = std::fs::read(&source).unwrap();
+    let output = run(&db, &["sync", source.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let synced = parse_first_line(&output);
+    assert_eq!(synced["data"]["committed"], 3);
+    for (since, until, expected) in [
+        (
+            "2025-01-01T00:00:00.123456789Z",
+            "2025-01-01T00:00:00.123456790Z",
+            "diskkvprecision exact",
+        ),
+        (
+            "2025-01-01T00:00:00.123456790Z",
+            "2025-01-01T00:00:00.123456791Z",
+            "diskkvprecision after",
+        ),
+    ] {
+        let output = run(
+            &db,
+            &[
+                "search",
+                "diskkvprecision",
+                "--provider",
+                "cursor",
+                "--since",
+                since,
+                "--until",
+                until,
+            ],
+        );
+        assert!(output.status.success(), "{}", stdout(&output));
+        let frame = parse_first_line(&output);
+        let hits = frame["data"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{frame}");
+        assert_eq!(hits[0]["text"], expected);
+    }
+    let conn = Connection::open(&db).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT payload FROM catalog WHERE id LIKE 'msg_v1_%'")
+        .unwrap();
+    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0)).unwrap();
+    let stored: std::collections::BTreeMap<String, String> = rows
+        .map(|row| {
+            let payload: serde_json::Value = serde_json::from_slice(&row.unwrap()).unwrap();
+            (
+                payload["text"].as_str().unwrap().to_owned(),
+                payload["timestamp"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(stored.len(), 3);
+    for (_, text, timestamp) in records {
+        assert_eq!(
+            stored[text], timestamp,
+            "retain original offset/fraction spelling"
+        );
+    }
+    let repeated = run(&db, &["sync", source.to_str().unwrap()]);
+    assert!(repeated.status.success(), "{}", stdout(&repeated));
+    assert_eq!(
+        parse_first_line(&repeated)["data"]["generation"],
+        synced["data"]["generation"]
+    );
+    assert_eq!(std::fs::read(source).unwrap(), original);
+}

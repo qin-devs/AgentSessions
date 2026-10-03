@@ -134,7 +134,7 @@ fn load_session_graph(&self, session: &StableId)
 Search ports and multi-session source events cross application/adapter boundaries.
 
 ### 2. Signatures
-`SemanticIndex::is_ready() -> PortResult<bool>`;
+`SemanticIndex::is_ready(query_dimension: usize) -> PortResult<bool>`;
 `semantic_model_id() -> PortResult<Option<String>>`;
 `query_semantic_filtered(&[f32], usize, &SearchFilters, &SearchFacets, bool)`
 returns `PortResult<Vec<SearchHit>>`. `SearchIndex::query_with_policy` accepts
@@ -142,7 +142,9 @@ the same facets and `include_system` visibility policy for lexical search.
 
 ### 3. Contracts
 Apply filters/facets/visibility before top-k. Only `Ok(false)` readiness permits
-explicit lexical fallback; errors retain their port classification. Reject
+explicit lexical fallback; errors retain their port classification. Readiness
+requires vectors for the selected model, query dimension and live catalog; zero
+dimension is not ready. Shared references must forward the exact dimension. Reject
 non-finite vectors/scores. `SearchProvider` is a private canonical wrapper:
 accepted IDs come from implemented searchable capability rows, with the
 historical `claude` alias. Source fingerprints are opaque: file BLAKE3 hex or
@@ -212,3 +214,74 @@ Correct: expose typed counts/status and keep private mappings in the adapter.
 ---
 
 **Language**: All documentation in **English**.
+
+## Scenario: Request read snapshots
+1. **Scope:** one read request across catalog/search/context/resume ports.
+2. **Signature:** `CatalogStore::begin_read_snapshot() -> PortResult<Box<dyn ReadSnapshot + '_>>`; `&T` forwards it.
+3. **Contract:** returned guards represent an already pinned view; nested guards share it until the last drops, including non-LIFO release. All mutable ports must use the same backend session. The default no-op is only for immutable/in-memory fixtures; persistent adapters and forwarding wrappers must override it.
+4. **Errors:** acquisition failure propagates as a port error; early return/unwind must release the guard. Adapter cleanup failure must fail closed on later acquisition, never silently reuse a stale snapshot.
+5. **Cases:** good: search IDs and their payloads share a generation; bad: independently reopened connections or a RefCell borrow retained through port calls.
+6. **Tests:** actual WAL writer interleavings, reference forwarding, nested scope and error/unwind cleanup.
+7. **Boundary:** this is a read capability, not an exposed SQLite transaction. Never hold it across writes, model loading, prompts or network/output waits.
+
+
+## Scenario: Provider timestamp and single-document BOM fidelity
+
+### 1. Scope / Trigger
+Provider parsing changes timestamp representations without changing source bytes,
+message identity, traversal order or provider maturity. Unit evidence is local to
+the provider field and variant, not a rule for every numeric timestamp.
+
+### 2. Signatures
+`MessageEvent.timestamp: Option<&str>` and `ParseReport::{skipped, diagnostics}`;
+`ProviderAdapter::{probe, parse}` and the default bounded source entry points.
+No new port, public DTO field or dependency is introduced.
+
+### 3. Contracts
+- Cursor ItemTable `timingInfo.startTime` and prompt `createdAt` integers are
+  Unix milliseconds. Normalize to UTC with exact millisecond precision; sort on
+  the original integers. Disk-kv bubble `createdAt` strings retain their spelling,
+  offset and fractional precision. Numeric bubble values have no proven unit and
+  must not borrow the composer's timestamp or a magnitude-based unit heuristic.
+- Native Cline `ts` is authoritative when present and accepts only integer JSON
+  tokens representable as i64. Do not use f64 or `fract() == 0`: deserialization
+  may already have rounded fractional tokens or underflowed them to zero.
+  Without `ts`, valid legacy `timestamp` date-time strings retain their spelling;
+  numeric compatibility values have no proven unit. Null/missing time stays absent.
+- Integer formatting is limited to four-digit years 0000..9999. Invalid Cline
+  timestamp metadata, out-of-range ItemTable integers and unsupported disk-kv
+  bubble metadata omit the time with a content-free diagnostic, retaining the
+  message. Cline aggregates its metadata-loss count; `skipped` counts lost
+  messages, not lost fields. ItemTable's existing whole-value type errors remain
+  distinct from this representable-integer conversion rule.
+- Cline probe and parse strip exactly one UTF-8 BOM at byte zero of the single
+  JSON document. Repeated/mid-document BOM stays invalid; U+FEFF within text is
+  preserved. This is not a change to shared JSONL readers or byte-span authority.
+- Parser 5 re-ingests unchanged sources once; schema stays 19. Since is inclusive,
+  until exclusive. Source identities and bytes remain unchanged. Cursor/Cline
+  stay Experimental; pinned implementation evidence is not format certification.
+
+### 4. Validation & Error Matrix
+Missing/null metadata -> no invented timestamp or warning. Unsupported timestamp
+metadata -> bounded field-loss diagnostic, not an empty string or a guessed time.
+Invalid single-document JSON/BOM placement -> existing probe/parse refusal.
+Cross-source intrinsic conflicts retain storage authority; only proven Cursor
+ItemTable spelling upgrades get the narrow aggregate-only storage exception.
+
+### 5. Good / Base / Bad Cases
+Good: native Cline `ts: -1` -> `1969-12-31T23:59:59.999Z`.
+Base: no timestamp remains `None`.
+Bad: numeric legacy `timestamp`, `1e-400` or `1735689600123.00001` must not become
+an invented integral instant; a Cline `ts` error must not fall back to another field.
+
+### 6. Tests Required
+Provider timestamp suites use raw JSON bytes for precision-loss counterexamples,
+plus pre-epoch/range/leap, missing/null, text/order/ID, BOM placement and bounded
+Cline diagnostic cases. Golden provenance pins units and source hashes. CLI
+covers millisecond/offset/nanosecond filters, one-time reparse, unchanged source
+bytes, duplicate-Cursor rolling replacement and the fixture revision matrix.
+
+### 7. Wrong vs Correct
+Wrong: `numeric.as_f64().filter(|v| v.fract() == 0.0)` or treating every `createdAt`
+as the same unit. Correct: validate the original integer token and the exact
+field/variant evidence, preserving unknown metadata as absent with diagnostics.

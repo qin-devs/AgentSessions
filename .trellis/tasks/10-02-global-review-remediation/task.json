@@ -1,0 +1,33 @@
+{
+  "id": "global-review-remediation",
+  "name": "global-review-remediation",
+  "title": "Implement verified global review remediation",
+  "description": "Execute verified global review with independent risk-focused checks",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": "agentsessions-adapters-sqlite",
+  "priority": "P1",
+  "creator": "QIN",
+  "assignee": "QIN",
+  "createdAt": "2026-10-02",
+  "completedAt": null,
+  "branch": "fix/global-review-remediation-20261002",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "10-02-review-boundaries",
+    "10-02-review-model-handoff",
+    "10-02-review-provider-fidelity",
+    "10-02-review-storage-consistency",
+    "10-02-review-read-surfaces",
+    "10-02-review-release-gates"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

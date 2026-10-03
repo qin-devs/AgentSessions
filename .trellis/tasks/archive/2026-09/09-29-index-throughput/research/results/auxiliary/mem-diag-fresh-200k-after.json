@@ -219,7 +219,7 @@
   ],
   "sample_note": "peak_mb = max of sampled WorkingSetSize (psapi.GetProcessMemoryInfo) over the run; samples downsampled by mem_diag.py",
   "provenance": {
-    "command": "cd <repo> && C:\\Users\\小Q\\AppData\\Local\\Programs\\Python\\Python310\\python.exe -B .trellis/tasks/09-29-index-throughput/research/scripts/mem_diag.py --binary C:\\AgentSessions-worktrees\\post-reuse-phase\\target\\release\\agent-session-grep.exe --db C:\\AgentSessions-worktrees\\post-reuse-phase\\target\\index-throughput\\mem-diag-fresh-200k-after\\catalog.db --dataset C:\\AgentSessions-worktrees\\post-reuse-phase\\target\\index-throughput\\corpus-200k-fresh --trace C:\\AgentSessions-worktrees\\post-reuse-phase\\target\\index-throughput\\mem-diag-fresh-200k-after\\trace.jsonl --interval-ms 20",
+    "command": "cd <repo> && <user-home>\\AppData\\Local\\Programs\\Python\\Python310\\python.exe -B .trellis/tasks/09-29-index-throughput/research/scripts/mem_diag.py --binary <repo>\\target\\release\\agent-session-grep.exe --db <repo>\\target\\index-throughput\\mem-diag-fresh-200k-after\\catalog.db --dataset <repo>\\target\\index-throughput\\corpus-200k-fresh --trace <repo>\\target\\index-throughput\\mem-diag-fresh-200k-after\\trace.jsonl --interval-ms 20",
     "wall_s": 40.769,
     "binary": {
       "path": "target\\release\\agent-session-grep.exe",
@@ -233,8 +233,8 @@
       "total_bytes": 56108235,
       "generator": "python -B .trellis/tasks/09-29-index-throughput/research/scripts/gen_corpus.py --out target/index-throughput/corpus-200k-fresh --messages 200000 --per-file 5000 --offset 1000000"
     },
-    "db_path": "C:\\AgentSessions-worktrees\\post-reuse-phase\\target\\index-throughput\\mem-diag-fresh-200k-after\\catalog.db",
-    "trace_path": "C:\\AgentSessions-worktrees\\post-reuse-phase\\target\\index-throughput\\mem-diag-fresh-200k-after\\trace.jsonl"
+    "db_path": "<repo>\\target\\index-throughput\\mem-diag-fresh-200k-after\\catalog.db",
+    "trace_path": "<repo>\\target\\index-throughput\\mem-diag-fresh-200k-after\\trace.jsonl"
   },
   "trace_records": [
     {

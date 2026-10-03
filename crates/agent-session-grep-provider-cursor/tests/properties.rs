@@ -10,7 +10,7 @@
 //! 2. seq 从 0 连续，committed == emit 数 == ground truth 消息数；
 //! 3. 确定性：同一字节两次解析，事件流与报告完全一致；
 //! 4. 元数据透传：role/text 原样（chatdata 按 startTime、prompts 按 createdAt
-//!    排序）、timestamp == startTime/createdAt 的十进制串、native_id 恒空；
+//!    排序）、timestamp == startTime/createdAt 的毫秒 UTC 表示、native_id 恒空；
 //! 5. 会话身份：session_native_id == 首个带 id 的会话（tab id 或
 //!    conversationId），多会话 fail-closed 为 Ambiguous；
 //! 6. probe 对任意字节永不 panic：Ok 时 confidence 非 Ambiguous 且 variant 恒为自身；
@@ -153,6 +153,7 @@ struct Case {
     expected: Vec<ExpectedMessage>,
     session_id: Option<String>,
     session_count: usize,
+    timestamp_diagnostics: usize,
     has_chatdata: bool,
     has_prompts: bool,
     saw_multi_tab: bool,
@@ -231,6 +232,26 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
     conn.execute_batch("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);")
         .expect("create ItemTable");
 
+    // Independent timestamp oracle: SQLite's calendar conversion, with whole
+    // seconds and the Euclidean millisecond remainder passed separately so no
+    // floating-point rounding can alter a half-open boundary.
+    let mut timestamp_diagnostics = 0;
+    let mut expected_timestamp = |millis: i64| {
+        let formatted: Option<String> = conn
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%S', ?1, 'unixepoch') \
+                 || printf('.%03dZ', ?2)",
+                params![millis.div_euclid(1_000), millis.rem_euclid(1_000)],
+                |row| row.get(0),
+            )
+            .expect("reference timestamp conversion");
+        // SQLite also accepts negative years; the formatter emits four
+        // unsigned year digits (24 bytes including the millisecond part).
+        let formatted = formatted.filter(|value| value.len() == 24);
+        timestamp_diagnostics += usize::from(formatted.is_none());
+        formatted
+    };
+
     let mut saw_multi_tab = false;
     let mut saw_idless_tab = false;
     let mut saw_raw_text = false;
@@ -290,7 +311,7 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
                 Some((
                     role.to_string(),
                     text.to_string(),
-                    start.map(|t| t.to_string()),
+                    start.and_then(&mut expected_timestamp),
                 ))
             } else {
                 None
@@ -355,7 +376,7 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
                 emitted: Some((
                     "user".to_string(),
                     "forced valid record".to_string(),
-                    Some("1".to_string()),
+                    Some("1970-01-01T00:00:00.001Z".to_string()),
                 )),
             }],
         });
@@ -425,14 +446,14 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
                 group_msgs.push((
                     "user".to_string(),
                     text.to_string(),
-                    p.created_at.map(|t| t.to_string()),
+                    p.created_at.and_then(&mut expected_timestamp),
                 ));
             }
             if let Some(text) = p.response.as_deref().filter(|t| !t.trim().is_empty()) {
                 group_msgs.push((
                     "assistant".to_string(),
                     text.to_string(),
-                    p.created_at.map(|t| t.to_string()),
+                    p.created_at.and_then(&mut expected_timestamp),
                 ));
             }
         }
@@ -465,7 +486,7 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
                 emitted: Some((
                     "user".to_string(),
                     "forced valid record".to_string(),
-                    Some("1".to_string()),
+                    Some("1970-01-01T00:00:00.001Z".to_string()),
                 )),
             }],
         });
@@ -476,7 +497,7 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
         expected.push(ExpectedMessage {
             role: "user".to_string(),
             text: "forced valid record".to_string(),
-            timestamp: Some("1".to_string()),
+            timestamp: Some("1970-01-01T00:00:00.001Z".to_string()),
         });
     }
 
@@ -564,6 +585,7 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
         expected,
         session_id,
         session_count,
+        timestamp_diagnostics,
         has_chatdata: !tabs.is_empty(),
         has_prompts: !prompts.is_empty(),
         saw_multi_tab,
@@ -642,7 +664,7 @@ fn prop_parse_is_deterministic() {
 }
 
 /// 性质 4：role/text 原样（chatdata 按 startTime、prompts 按 createdAt 排序）、
-/// timestamp == startTime/createdAt 十进制串、native_id 恒空（tab id 与
+/// timestamp == startTime/createdAt 毫秒 UTC 表示、native_id 恒空（tab id 与
 /// prompt id 是会话级身份，不是消息级 id）、无 parent、无 sidechain。
 #[test]
 fn prop_metadata_survives_verbatim() {
@@ -665,7 +687,7 @@ fn prop_metadata_survives_verbatim() {
             );
             assert_eq!(
                 got.timestamp, want.timestamp,
-                "seed={seed} seq={seq}: timestamp 必须等于 startTime/createdAt 十进制串"
+                "seed={seed} seq={seq}: timestamp 必须等于 startTime/createdAt 毫秒 UTC 表示"
             );
             assert_eq!(
                 got.native_id, "",
@@ -684,7 +706,7 @@ fn prop_metadata_survives_verbatim() {
 }
 
 /// 性质 5：会话身份——session_count 与首个非空 id 与 ground truth 一致；
-/// 多会话 fail-closed 为 Ambiguous 且留下一一条诊断。
+/// 多会话 fail-closed 为 Ambiguous；只有不可表示的时间戳产生字段丢失诊断。
 #[test]
 fn prop_session_identity_matches_ground_truth() {
     for_each_seed(|seed, case| {
@@ -700,9 +722,12 @@ fn prop_session_identity_matches_ground_truth() {
         );
         assert_eq!(
             report.diagnostics.len(),
-            0,
-            "seed={seed}: supported multi-session sources need no diagnostic"
+            case.timestamp_diagnostics,
+            "seed={seed}: only out-of-range timestamps need diagnostics"
         );
+        assert!(report.diagnostics.iter().all(|note| {
+            note == "cursor ItemTable: out-of-range epoch-millisecond timestamp omitted"
+        }));
         match (case.session_id.as_deref(), multi) {
             (Some(id), false) => assert_eq!(
                 report.session_observation.provider_session_id,

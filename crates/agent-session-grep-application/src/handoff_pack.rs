@@ -26,7 +26,7 @@ use agent_session_grep_ports::handoff::{
     RedactionState, RedactionStatus, RetrievalMode, SessionConfidence, SourceLocator, TimeWindow,
     TruncationReason, TruncationStatus,
 };
-use agent_session_grep_ports::{ContextGraphStore, PortResult, SearchHit};
+use agent_session_grep_ports::{ContextGraphStore, PortError, PortResult, SearchHit};
 
 /// 一条命中对应的权威 source placement（由调用方经 [`ContextGraphStore`] 批量解析）。
 ///
@@ -103,7 +103,7 @@ const PACK_TIME_BASE_UNIX: u64 = 1_786_838_400;
 /// - 证据文本默认经共享脱敏引擎（ADR-0009），`redaction` 如实反映；
 /// - `source_document_id`/span 来自调用方传入的权威 placement，无 placement 的
 ///   命中不进证据（never fabricated）。
-pub fn generate_deterministic(input: HandoffInput<'_>) -> HandoffPack {
+pub fn generate_deterministic(input: HandoffInput<'_>) -> PortResult<HandoffPack> {
     let created_at = created_at_from_generation(input.catalog_generation);
     let pack_id = derive_pack_id(&input);
     let matched_sessions = build_matched_sessions(input.hits);
@@ -200,22 +200,6 @@ pub fn generate_deterministic(input: HandoffInput<'_>) -> HandoffPack {
         })
         .collect();
 
-    // 整体置信度：有证据 → 单会话 High / 多会话 Medium；无证据 → Low。
-    let overall = if evidence.is_empty() {
-        ConfidenceLevel::Low
-    } else if matched_sessions.len() > 1 {
-        ConfidenceLevel::Medium
-    } else {
-        ConfidenceLevel::High
-    };
-    let per_session: Vec<SessionConfidence> = matched_sessions
-        .iter()
-        .map(|s| SessionConfidence {
-            session_id: s.session_id.clone(),
-            confidence: overall,
-        })
-        .collect();
-
     let mut pack = HandoffPack {
         schema_version: HandoffPack::SCHEMA_VERSION.to_string(),
         pack_id,
@@ -251,8 +235,8 @@ pub fn generate_deterministic(input: HandoffInput<'_>) -> HandoffPack {
             audit_id: None,
         },
         confidence: PackConfidence {
-            overall,
-            per_session,
+            overall: ConfidenceLevel::Low,
+            per_session: Vec::new(),
         },
         // Project caller-supplied activities (already redacted at source when
         // needed). Empty when the catalog has no tool_activities for these hits.
@@ -268,38 +252,68 @@ pub fn generate_deterministic(input: HandoffInput<'_>) -> HandoffPack {
     // （dropped_locators/source_locators）——`max_bytes` 是 pack 内容预算，
     // 诊断元数据不占用户预算；`used_bytes` 报告内容字节（与 max_bytes 可比）。
     loop {
-        let bytes = content_bytes(&pack);
-        pack.budget.used_bytes = bytes;
-        if bytes <= input.max_bytes || pack.evidence.is_empty() {
-            break;
-        }
-        if let Some(dropped) = pack.evidence.pop() {
-            pack.truncation.truncated = true;
-            pack.truncation.reason = TruncationReason::MaxBytes;
-            pack.truncation.dropped_locators.push(SourceLocator {
-                source_document_id: dropped.source_document_id.clone(),
-                cursor: Some(dropped.message_id.clone()),
-            });
-            pack.truncation.dropped_count = pack.truncation.dropped_locators.len() as u64;
-            pack.mainline.pop();
-            redacted_flags.pop();
-        }
+        // Measure the final metadata, not the pre-trim confidence/redaction.
+        // Even a few bytes of status growth must not escape the hard bound.
+        let overall = if pack.evidence.is_empty() {
+            ConfidenceLevel::Low
+        } else if pack.matched_sessions.len() > 1 {
+            ConfidenceLevel::Medium
+        } else {
+            ConfidenceLevel::High
+        };
+        pack.confidence.overall = overall;
+        pack.confidence.per_session = pack
+            .matched_sessions
+            .iter()
+            .map(|session| SessionConfidence {
+                session_id: session.session_id.clone(),
+                confidence: if pack.evidence.iter().any(|evidence| {
+                    evidence.session_id.as_deref() == Some(session.session_id.as_str())
+                }) {
+                    overall
+                } else {
+                    ConfidenceLevel::Low
+                },
+            })
+            .collect();
+        let redacted_count = redacted_flags.iter().filter(|&&redacted| redacted).count() as u64;
+        pack.redaction.redacted_count = redacted_count;
+        pack.redaction.status = if redacted_count > 0 {
+            RedactionState::Applied
+        } else {
+            RedactionState::None
+        };
         pack.budget.used_tokens = pack
             .evidence
             .iter()
             .map(|entry| estimate_tokens(&entry.text))
             .sum();
+        let bytes = content_bytes(&pack);
+        pack.budget.used_bytes = bytes;
+        if bytes <= input.max_bytes {
+            break;
+        }
+        if let Some(dropped) = pack.evidence.pop() {
+            pack.truncation.dropped_locators.push(SourceLocator {
+                source_document_id: dropped.source_document_id,
+                cursor: Some(dropped.message_id),
+            });
+            pack.mainline.pop();
+            redacted_flags.pop();
+        } else if !pack.tool_activity.is_empty() {
+            pack.tool_activity.pop();
+        } else if !pack.matched_sessions.is_empty() {
+            // No retained evidence can reference the removed session here.
+            pack.matched_sessions.pop();
+        } else {
+            return Err(PortError::InvalidRequest(
+                "handoff max_bytes is too small for mandatory content".into(),
+            ));
+        }
+        pack.truncation.truncated = true;
+        pack.truncation.reason = TruncationReason::MaxBytes;
+        pack.truncation.dropped_count += 1;
     }
-
-    // 脱敏状态：对保留的证据逐条统计。默认模式（cross-boundary）下真实跑了
-    // 共享脱敏引擎，`redacted_count` 为被替换条数。
-    let redacted_count = redacted_flags.iter().filter(|&&redacted| redacted).count() as u64;
-    pack.redaction.redacted_count = redacted_count;
-    pack.redaction.status = if redacted_count > 0 {
-        RedactionState::Applied
-    } else {
-        RedactionState::None
-    };
 
     // Source locators：保留证据的去重反向追踪引用（文档 + 精确消息 cursor）。
     let mut source_locators: Vec<SourceLocator> = Vec::new();
@@ -317,7 +331,7 @@ pub fn generate_deterministic(input: HandoffInput<'_>) -> HandoffPack {
     // 最终 used_bytes：与内容口径自洽（content_bytes 稳定，不自指）。
     pack.budget.used_bytes = content_bytes(&pack);
 
-    pack
+    Ok(pack)
 }
 
 /// 一条已通过脱敏与定位的候选证据。id 均为 wire 字符串（pack JSON 权威形态，
@@ -442,30 +456,22 @@ fn content_bytes(pack: &HandoffPack) -> u64 {
 
 /// Derive a deterministic pack_id from generation + query + filters + budget.
 fn derive_pack_id(input: &HandoffInput<'_>) -> String {
+    // Labeled JSON fields escape delimiters and distinguish absent/empty
+    // values. Revision 2 invalidates old ambiguous cache identities without
+    // changing the public pack schema or wire-prefix contract.
+    let identity = serde_json::json!({
+        "catalog_generation": input.catalog_generation,
+        "retrieval_mode": input.retrieval_mode.as_str(),
+        "query_terms": input.query_terms,
+        "filters": input.filters,
+        "max_tokens": input.max_tokens,
+        "max_bytes": input.max_bytes,
+        "max_evidence": input.max_evidence,
+        "target": input.target,
+    });
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"handoff-pack/v1\0");
-    hasher.update(format!("gen={}\0", input.catalog_generation).as_bytes());
-    hasher.update(input.retrieval_mode.as_str().as_bytes());
-    hasher.update(b"\0");
-    for term in input.query_terms {
-        hasher.update(term.as_bytes());
-        hasher.update(b"\0");
-    }
-    for provider in &input.filters.providers {
-        hasher.update(provider.as_bytes());
-        hasher.update(b"\0");
-    }
-    if let Some(since) = &input.filters.since {
-        hasher.update(since.as_bytes());
-        hasher.update(b"\0");
-    }
-    if let Some(until) = &input.filters.until {
-        hasher.update(until.as_bytes());
-        hasher.update(b"\0");
-    }
-    hasher.update(format!("tokens={}\0", input.max_tokens).as_bytes());
-    hasher.update(format!("bytes={}\0", input.max_bytes).as_bytes());
-    hasher.update(format!("evidence={}\0", input.max_evidence).as_bytes());
+    hasher.update(b"handoff-pack/identity-v2\0");
+    hasher.update(identity.to_string().as_bytes());
     let hash = hasher.finalize();
     format!("pack_v1_{}", &hash.to_hex()[..16])
 }
@@ -562,7 +568,7 @@ mod tests {
     /// 便捷包装：为命中生成默认 source placements 并构造默认输入。
     fn generate(hits: &[SearchHit]) -> HandoffPack {
         let locs = locations(hits);
-        generate_deterministic(default_input(hits, &locs))
+        generate_deterministic(default_input(hits, &locs)).unwrap()
     }
 
     #[test]
@@ -597,6 +603,52 @@ mod tests {
     }
 
     #[test]
+    fn audit_pack_identity_delimits_filter_fields_and_optional_values() {
+        let mut since = default_input(&[], &[]);
+        since.filters.since = Some("2026-01-01T00:00:00Z".into());
+        let mut until = default_input(&[], &[]);
+        until.filters.until = since.filters.since.clone();
+        assert_ne!(derive_pack_id(&since), derive_pack_id(&until));
+        let none = default_input(&[], &[]);
+        let mut empty = default_input(&[], &[]);
+        empty.filters.since = Some(String::new());
+        assert_ne!(derive_pack_id(&none), derive_pack_id(&empty));
+        let terms = vec!["same-value".to_string()];
+        let mut query = default_input(&[], &[]);
+        query.query_terms = &terms;
+        let mut provider = default_input(&[], &[]);
+        provider.filters.providers = terms.clone();
+        assert_ne!(derive_pack_id(&query), derive_pack_id(&provider));
+    }
+
+    #[test]
+    fn audit_handoff_never_returns_oversized_mandatory_content() {
+        let terms = vec!["x".repeat(10_000)];
+        let mut input = default_input(&[], &[]);
+        input.query_terms = &terms;
+        input.max_bytes = 4096;
+        assert!(matches!(
+            generate_deterministic(input),
+            Err(PortError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn audit_handoff_trims_metadata_and_recomputes_empty_confidence() {
+        let hits = vec![hit("msg_v1_audit", 1.0, &"body ".repeat(2000))];
+        let locs = locations(&hits);
+        let activities = vec![serde_json::json!({"result": "x".repeat(12_000)})];
+        let mut input = default_input(&hits, &locs);
+        input.tool_activities = &activities;
+        input.max_bytes = 4096;
+        let pack = generate_deterministic(input).unwrap();
+        assert!(pack.budget.used_bytes <= pack.budget.max_bytes);
+        assert!(pack.evidence.is_empty());
+        assert_eq!(pack.confidence.overall, ConfidenceLevel::Low);
+        assert!(pack.truncation.truncated);
+    }
+
+    #[test]
     fn empty_hits_produces_low_confidence() {
         let hits: Vec<SearchHit> = vec![];
         let pack = generate(&hits);
@@ -627,8 +679,8 @@ mod tests {
         let mut other = default_input(&hits, &locs);
         other.max_tokens = 500;
         assert_ne!(
-            generate_deterministic(base).pack_id,
-            generate_deterministic(other).pack_id
+            generate_deterministic(base).unwrap().pack_id,
+            generate_deterministic(other).unwrap().pack_id
         );
     }
 
@@ -646,7 +698,7 @@ mod tests {
         let locs = locations(&hits);
         let mut input = default_input(&hits, &locs);
         input.max_evidence = 3;
-        let pack = generate_deterministic(input);
+        let pack = generate_deterministic(input).unwrap();
         assert!(pack.truncation.truncated);
         assert_eq!(pack.truncation.reason, TruncationReason::MaxEvidence);
         assert_eq!(pack.evidence.len(), 3);
@@ -662,7 +714,7 @@ mod tests {
         let locs = locations(&hits);
         let mut input = default_input(&hits, &locs);
         input.max_tokens = 5; // 极小的 token 预算
-        let pack = generate_deterministic(input);
+        let pack = generate_deterministic(input).unwrap();
         assert!(pack.truncation.truncated);
         assert_eq!(pack.truncation.reason, TruncationReason::BudgetExceeded);
         assert!(pack.evidence.len() < 2);
@@ -682,7 +734,7 @@ mod tests {
         let locs = locations(&hits);
         let mut input = default_input(&hits, &locs);
         input.max_bytes = 1500; // 只容得下几条证据
-        let pack = generate_deterministic(input);
+        let pack = generate_deterministic(input).unwrap();
         assert!(pack.truncation.truncated, "{:?}", pack.truncation.reason);
         assert_eq!(pack.truncation.reason, TruncationReason::MaxBytes);
         assert!(pack.budget.used_bytes <= 1500, "{}", pack.budget.used_bytes);
@@ -701,7 +753,7 @@ mod tests {
             byte_start: None,
             byte_end: None,
         }];
-        let pack = generate_deterministic(default_input(&hits, &no_locs));
+        let pack = generate_deterministic(default_input(&hits, &no_locs)).unwrap();
         assert_eq!(pack.evidence.len(), 0);
         assert_eq!(pack.confidence.overall, ConfidenceLevel::Low);
         assert_eq!(pack.matched_sessions.len(), 1); // 命中归属会话仍在 matched 列表
@@ -770,8 +822,8 @@ mod tests {
         input1.query_terms = &terms1;
         let mut input2 = default_input(&hits, &locs);
         input2.query_terms = &terms2;
-        let pack1 = generate_deterministic(input1);
-        let pack2 = generate_deterministic(input2);
+        let pack1 = generate_deterministic(input1).unwrap();
+        let pack2 = generate_deterministic(input2).unwrap();
         assert_ne!(pack1.pack_id, pack2.pack_id);
     }
 
@@ -975,7 +1027,7 @@ mod tests {
             };
             let mut input = default_input(&hits, &locs);
             input.filters = filters;
-            let pack = generate_deterministic(input);
+            let pack = generate_deterministic(input).unwrap();
 
             assert!(
                 !pack.evidence.is_empty(),

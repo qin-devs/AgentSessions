@@ -784,6 +784,24 @@ fn walk_composer(
             continue;
         };
 
+        // The proven bubble field is an ISO string, not the composer's
+        // numeric epoch metadata. Preserve the source spelling (including
+        // offset and fractional precision); never infer a unit or invent a
+        // timestamp from the composer when this field is absent.
+        let timestamp = match body.get("createdAt") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                Some(value.as_str())
+            }
+            Some(_) => {
+                outcome.notes.push(format!(
+                    "cursorDiskKV composer `{composer_id}`: header slot {slot}: \
+                     timestamp omitted (createdAt must be a non-empty ISO string)"
+                ));
+                None
+            }
+        };
+
         state
             .sink
             .emit_message(MessageEvent {
@@ -795,7 +813,7 @@ fn walk_composer(
                 parent_native_id: None,
                 role,
                 text: &message_text,
-                timestamp: None,
+                timestamp,
                 is_sidechain: false,
                 span: None, // SQLite rows have no byte spans in the verified snapshot
             })

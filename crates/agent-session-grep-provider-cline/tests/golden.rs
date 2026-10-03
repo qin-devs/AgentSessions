@@ -22,6 +22,16 @@ const EXPECTED_PATH: &str = concat!(
     "/tests/golden/basic.expected.json"
 );
 
+const TIMESTAMP_FIXTURE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/golden/epoch-millis-bom.json"
+);
+
+const TIMESTAMP_EXPECTED_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/golden/epoch-millis-bom.expected.json"
+);
+
 /// 解析 fixture：经共享 sink 全字段捕获，返回报告与 sink。
 fn parse_fixture(bytes: &[u8]) -> (ParseReport, CapturingSink) {
     golden::parse_golden(&ClineAdapter::new(), bytes)
@@ -50,7 +60,7 @@ fn parse_never_mutates_source_bytes() {
 
 #[test]
 fn golden_provenance_revision_matches_manifest() {
-    assert_eq!(ClineAdapter::new().manifest().fixture_revision, Some(1));
+    assert_eq!(ClineAdapter::new().manifest().fixture_revision, Some(2));
 }
 
 #[test]
@@ -101,6 +111,63 @@ fn golden_messages_carry_no_byte_span() {
 #[ignore = "manual regeneration helper — prints canonical JSON for basic.expected.json"]
 fn print_actual_canonical_output_for_regeneration() {
     let bytes = std::fs::read(FIXTURE_PATH).expect("read basic.json fixture");
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let (report, sink) = parse_fixture(&bytes);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&golden::canonical_json(&hash, &report, &sink.messages))
+            .unwrap()
+    );
+}
+
+#[test]
+fn golden_epoch_millis_bom_preserves_text_and_reports_metadata_loss() {
+    let expected = golden::read_expected(TIMESTAMP_EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(TIMESTAMP_FIXTURE_PATH, &expected);
+    assert!(bytes.starts_with(b"\xef\xbb\xbf"));
+    let (report, sink) = parse_fixture(&bytes);
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    assert_eq!(
+        golden::canonical_json(&hash, &report, &sink.messages),
+        expected
+    );
+    assert_eq!(report.committed, 7);
+    assert_eq!(report.skipped, 0);
+    assert_eq!(report.session_native_id, None);
+    assert_eq!(report.diagnostics.len(), 1);
+    assert!(report.diagnostics[0].starts_with("2 message timestamps"));
+    let timestamps: Vec<_> = sink
+        .messages
+        .iter()
+        .map(|message| message.timestamp.as_deref())
+        .collect();
+    assert_eq!(
+        timestamps,
+        vec![
+            Some("2025-01-01T00:00:00.123Z"),
+            Some("1970-01-01T00:00:00.000Z"),
+            Some("1969-12-31T23:59:59.999Z"),
+            Some("2026-01-01T00:01:00Z"),
+            None,
+            None,
+            None,
+        ]
+    );
+    assert_eq!(
+        sink.messages[0].text,
+        "  synthetic millisecond boundary \u{feff} retained  "
+    );
+    assert!(
+        sink.messages
+            .iter()
+            .all(|message| message.span.is_none() && message.native_id.is_empty())
+    );
+}
+
+#[test]
+#[ignore = "manual regeneration helper — prints canonical JSON for epoch-millis-bom.expected.json"]
+fn print_epoch_millis_bom_canonical_output_for_regeneration() {
+    let bytes = std::fs::read(TIMESTAMP_FIXTURE_PATH).expect("read timestamp fixture");
     let hash = blake3::hash(&bytes).to_hex().to_string();
     let (report, sink) = parse_fixture(&bytes);
     println!(

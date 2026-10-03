@@ -18,6 +18,7 @@ use agent_session_grep_ports::relocation::{
 const LIVE_SOURCE_TABLES: &[&str] = &[
     "source_scans",
     "source_membership",
+    "source_entity_projections",
     "source_placement_membership",
     "source_relation_scans",
     "source_session_resume_claims",
@@ -1646,6 +1647,8 @@ impl SqliteStore {
         Self::register_scalar_functions(&conn)?;
         let store = SqliteStore {
             conn: RefCell::new(conn),
+            read_snapshot_count: Default::default(),
+            read_snapshot_failed: Default::default(),
             _lease: Some(lease),
             semantic_model_id: RefCell::new(None),
             repo_slug_resolver: RefCell::new(Box::new(NoopRepoSlugResolver)),

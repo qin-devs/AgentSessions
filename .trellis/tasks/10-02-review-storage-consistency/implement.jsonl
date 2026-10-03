@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/agentsessions-adapters-sqlite/backend/index.md", "reason": "Package contracts"}
+{"file": ".trellis/tasks/10-02-global-review-remediation/design.md", "reason": "Approved decisions and scopes"}
+{"file": ".trellis/tasks/10-02-global-review-remediation/research/baseline.md", "reason": "Fixed baseline and upstream work"}
+{"file": ".trellis/spec/agentsessions-application/backend/index.md", "reason": "Context orchestration and port error contracts"}
+{"file": ".trellis/spec/agentsessions-ports/backend/index.md", "reason": "Request read snapshot port contract"}

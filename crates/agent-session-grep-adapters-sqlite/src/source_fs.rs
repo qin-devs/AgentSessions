@@ -66,15 +66,23 @@ fn verify_metadata(meta: &std::fs::Metadata, snap: &SourceSnapshot) -> PortResul
     Ok(())
 }
 
+fn has_sqlite_header(reader: &mut dyn Read) -> PortResult<bool> {
+    let mut header = [0; 16];
+    match reader.read_exact(&mut header) {
+        Ok(()) => Ok(&header == b"SQLite format 3\0"),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(backend(error)),
+    }
+}
+
 /// Capture `(len, mtime, BLAKE3)` with one fixed-buffer pass.
 ///
 /// Text files use a streaming byte fingerprint. SQLite files use a bounded
 /// logical backup so committed WAL frames are included, with a `sqlite:`
 /// fingerprint prefix identifying the logical verification strategy.
 pub fn capture(path: &Path) -> PortResult<SourceSnapshot> {
-    let mut header = [0; 16];
     let mut file = File::open(path).map_err(backend)?;
-    if file.read(&mut header).map_err(backend)? == header.len() && &header == b"SQLite format 3\0" {
+    if has_sqlite_header(&mut file)? {
         let copy = sqlite_snapshot(path)?;
         let mut snapshot = capture_file(&copy)?;
         snapshot.path = path.to_string_lossy().into_owned();
@@ -304,6 +312,61 @@ impl agent_session_grep_ports::SourceDiscovery for SnapshotFs {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    struct HeaderReader {
+        bytes: std::io::Cursor<Vec<u8>>,
+        chunk: usize,
+        fail_after: Option<u64>,
+    }
+
+    impl Read for HeaderReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self
+                .fail_after
+                .is_some_and(|at| self.bytes.position() >= at)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic read failure",
+                ));
+            }
+            let count = out.len().min(self.chunk);
+            self.bytes.read(&mut out[..count])
+        }
+    }
+
+    #[test]
+    fn sqlite_header_detection_handles_segmented_reads() {
+        for chunk in 1..=16 {
+            let mut reader = HeaderReader {
+                bytes: std::io::Cursor::new(b"SQLite format 3\0payload".to_vec()),
+                chunk,
+                fail_after: None,
+            };
+            assert!(has_sqlite_header(&mut reader).unwrap(), "chunk={chunk}");
+            assert_eq!(reader.bytes.position(), 16);
+        }
+    }
+
+    #[test]
+    fn sqlite_header_detection_distinguishes_eof_and_io_error() {
+        for bytes in [
+            b"SQLite".as_slice(),
+            b"ordinary source contents".as_slice(),
+            b"".as_slice(),
+        ] {
+            assert!(!has_sqlite_header(&mut std::io::Cursor::new(bytes)).unwrap());
+        }
+        let mut reader = HeaderReader {
+            bytes: std::io::Cursor::new(b"SQLite format 3\0".to_vec()),
+            chunk: 4,
+            fail_after: Some(4),
+        };
+        assert!(matches!(
+            has_sqlite_header(&mut reader),
+            Err(PortError::SourceIo(_))
+        ));
+    }
 
     #[test]
     fn sqlite_capture_reads_wal_and_detects_wal_only_changes_without_writing_source() {

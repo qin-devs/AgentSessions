@@ -1,0 +1,11 @@
+﻿[
+  {"role": "user", "content": "  synthetic millisecond boundary \uFEFF retained  ", "ts": 1735689600123, "id": "ignored-message", "taskId": "ignored-task"},
+  {"role": "assistant", "content": "synthetic epoch zero", "ts": 0},
+  {"role": "user", "content": "synthetic negative millisecond", "ts": -1},
+  {"role": "assistant", "content": "synthetic compatible string", "timestamp": "2026-01-01T00:01:00Z"},
+  {"role": "user", "content": "synthetic absent timestamp"},
+  {"role": "assistant", "content": "synthetic unproven numeric alias", "timestamp": 1735689600123},
+  {"role": "user", "content": "synthetic invalid native timestamp", "ts": {"private": "synthetic-private-timestamp"}},
+  {"role": "system", "content": "synthetic ignored role", "ts": "invalid"},
+  {"role": "assistant", "content": "", "ts": "invalid"}
+]

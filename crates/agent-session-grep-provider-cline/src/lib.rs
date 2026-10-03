@@ -12,7 +12,7 @@
 
 use agent_session_grep_ports::{
     AdapterManifest, CanonicalEventSink, Confidence, MessageEvent, ParseReport, ProbeResult,
-    ProviderAdapter, ProviderError, manifest_for,
+    ProviderAdapter, ProviderError, SearchInstant, manifest_for,
 };
 
 /// Variant id surfaced in probe results.
@@ -40,8 +40,6 @@ struct ClineMessage {
     role: String,
     #[serde(default)]
     content: Option<serde_json::Value>,
-    #[serde(default)]
-    timestamp: Option<serde_json::Value>,
 }
 
 impl ProviderAdapter for ClineAdapter {
@@ -52,7 +50,7 @@ impl ProviderAdapter for ClineAdapter {
     fn manifest(&self) -> AdapterManifest {
         manifest_for(
             self.provider_id(),
-            Some(1),
+            Some(2),
             &[
                 "no session id in the JSON array file; session_native_id is left unset",
                 "no byte spans (whole-file JSON array); native message ids are not preserved (ids are derived, not native)",
@@ -61,9 +59,7 @@ impl ProviderAdapter for ClineAdapter {
     }
 
     fn probe(&self, bytes: &[u8]) -> Result<ProbeResult, ProviderError> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|e| ProviderError::StructuralFatal(format!("not valid UTF-8: {e}")))?;
-        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let text = cline_document_text(bytes)?;
 
         let mut matched = Vec::new();
         let unmatched = Vec::new();
@@ -142,8 +138,7 @@ impl ProviderAdapter for ClineAdapter {
         bytes: &[u8],
         sink: &mut dyn CanonicalEventSink,
     ) -> Result<ParseReport, ProviderError> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|e| ProviderError::StructuralFatal(format!("not valid UTF-8: {e}")))?;
+        let text = cline_document_text(bytes)?;
 
         let value: serde_json::Value = serde_json::from_str(text)
             .map_err(|e| ProviderError::StructuralFatal(format!("not valid JSON: {e}")))?;
@@ -154,6 +149,7 @@ impl ProviderAdapter for ClineAdapter {
 
         let mut report = ParseReport::default();
         let mut seq: u32 = 0;
+        let mut invalid_timestamps = 0usize;
 
         for (idx, record) in arr.iter().enumerate() {
             let rec: ClineMessage = match serde_json::from_value(record.clone()) {
@@ -178,11 +174,13 @@ impl ProviderAdapter for ClineAdapter {
                 continue;
             }
 
-            let timestamp = rec
-                .timestamp
-                .as_ref()
-                .and_then(|v| v.as_str())
-                .or_else(|| rec.timestamp.as_ref().and_then(|v| v.as_i64().map(|_| "")));
+            let timestamp = match cline_timestamp(record) {
+                Ok(timestamp) => timestamp,
+                Err(()) => {
+                    invalid_timestamps += 1;
+                    None
+                }
+            };
 
             sink.emit_message(MessageEvent {
                 session: None,
@@ -191,7 +189,7 @@ impl ProviderAdapter for ClineAdapter {
                 parent_native_id: None,
                 role,
                 text: &text,
-                timestamp,
+                timestamp: timestamp.as_deref(),
                 is_sidechain: false,
                 // Cline is a single JSON array, not a line-delimited format: the
                 // adapter cannot attribute a byte range to one message without
@@ -205,8 +203,136 @@ impl ProviderAdapter for ClineAdapter {
             report.committed += 1;
         }
 
+        if invalid_timestamps > 0 {
+            report.diagnostics.push(format!(
+                "{invalid_timestamps} message timestamps invalid or unsupported; omitted"
+            ));
+        }
         Ok(report)
     }
+}
+
+/// Decode a single JSON document without changing snapshot bytes. The bounded
+/// reader delegates here too; never strip BOMs from individual records or text.
+fn cline_document_text(bytes: &[u8]) -> Result<&str, ProviderError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| ProviderError::StructuralFatal(format!("not valid UTF-8: {e}")))?;
+    Ok(text.strip_prefix('\u{feff}').unwrap_or(text))
+}
+
+/// Native Cline `ts` is Date.now() milliseconds (see tests/golden/PROVENANCE.md).
+/// The existing `timestamp` compatibility field accepts validated strings; its
+/// numeric units are unproven, so they must not be guessed or emitted empty.
+fn cline_timestamp(record: &serde_json::Value) -> Result<Option<String>, ()> {
+    if let Some(value) = record.get("ts") {
+        return if value.is_null() {
+            Ok(None)
+        } else {
+            cline_epoch_millis(value).map(Some).ok_or(())
+        };
+    }
+    match record.get("timestamp") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) if valid_timestamp_text(text).is_some() => {
+            Ok(Some(text.clone()))
+        }
+        _ => Err(()),
+    }
+}
+
+/// Accept the integer JSON tokens written by Date.now(), within four-digit ISO
+/// years. Never convert through f64: deserialization can already have rounded a
+/// fractional value to an integer, or underflowed it to zero.
+fn cline_epoch_millis(value: &serde_json::Value) -> Option<String> {
+    const MIN_MILLIS: i64 = -62_167_219_200_000; // 0000-01-01T00:00:00.000Z
+    const MAX_MILLIS: i64 = 253_402_300_799_999; // 9999-12-31T23:59:59.999Z
+    let millis = value.as_i64()?;
+    if !(MIN_MILLIS..=MAX_MILLIS).contains(&millis) {
+        return None;
+    }
+    let instant = SearchInstant::from_unix_millis(millis);
+    let days = instant.unix_seconds.div_euclid(86_400);
+    let time = instant.unix_seconds.rem_euclid(86_400);
+
+    // Gregorian civil-from-days arithmetic, also used by the Hermes adapter.
+    // Euclidean division keeps negative epoch values on the correct UTC day.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    let (hour, minute, second) = (time / 3_600, (time % 3_600) / 60, time % 60);
+    let fraction = instant.nanosecond / 1_000_000;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{fraction:03}Z"
+    ))
+}
+
+/// Validate ISO date-time compatibility text without changing its spelling.
+/// Accept the existing UTC/offset forms (T or space, optional zone and fraction).
+fn valid_timestamp_text(text: &str) -> Option<()> {
+    let bytes = text.trim().as_bytes();
+    if bytes.len() < 19
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let year = timestamp_digits(&bytes[..4])?;
+    let month = timestamp_digits(&bytes[5..7])?;
+    let day = timestamp_digits(&bytes[8..10])?;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if day == 0
+        || day > days_in_month
+        || timestamp_digits(&bytes[11..13])? > 23
+        || timestamp_digits(&bytes[14..16])? > 59
+        || timestamp_digits(&bytes[17..19])? > 59
+    {
+        return None;
+    }
+    let mut zone = &bytes[19..];
+    if zone.first() == Some(&b'.') {
+        let digits = zone[1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return None;
+        }
+        zone = &zone[digits + 1..];
+    }
+    match zone {
+        [] | [b'Z'] => Some(()),
+        [b'+' | b'-', h1, h2, b':', m1, m2] | [b'+' | b'-', h1, h2, m1, m2] => {
+            (timestamp_digits(&[*h1, *h2])? <= 23 && timestamp_digits(&[*m1, *m2])? <= 59)
+                .then_some(())
+        }
+        _ => None,
+    }
+}
+
+fn timestamp_digits(bytes: &[u8]) -> Option<u32> {
+    bytes.iter().try_fold(0, |value, byte| {
+        if byte.is_ascii_digit() {
+            Some(value * 10 + u32::from(*byte - b'0'))
+        } else {
+            None
+        }
+    })
 }
 
 /// Extract text from Cline message content.
@@ -244,7 +370,7 @@ mod tests {
         assert_eq!(manifest.capabilities.provider_id, adapter.provider_id());
         assert_eq!(manifest.capabilities.variant_id, VARIANT_ID);
         assert!(manifest.last_certified_targets.is_empty());
-        assert_eq!(manifest.fixture_revision, Some(1));
+        assert_eq!(manifest.fixture_revision, Some(2));
     }
 
     struct CountSink {

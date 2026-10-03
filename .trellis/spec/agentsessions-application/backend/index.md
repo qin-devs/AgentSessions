@@ -78,6 +78,11 @@ adapters know *how*. Depends on `agentsessions-domain` and
   charged per retained occurrence. Budget fallback retries in detail order
   `sessions -> talks -> raw`; context item clamps expose `max_messages`, never
   the internal generic `max_items` reason.
+- Context activity reads use only retained Message IDs after budgeting. Port
+  failures propagate as `AppError::Port` even for an empty selected graph;
+  `Ok([])` remains a valid result for absent optional activity projections.
+  Never replace an activity storage error with successful empty output. Usage
+  aggregation follows the same existing error-propagation contract.
 - `ContextMessage` carries `{ id, placement_id, message_id, payload }`;
   `id == message_id` is the compatibility alias and `placement_id` is
   authoritative. `branch_leaf_placement_id` is authoritative while
@@ -93,6 +98,12 @@ adapters know *how*. Depends on `agentsessions-domain` and
   the first request's `issued_at_ms`; only `offset` changes between pages.
   Preserve `expires_at_ms`, so search pagination never extends the original
   15-minute TTL. The digest version includes the clock-anchor revision.
+- Current-repository scoring uses the filtered `SearchHit.session_id` when
+  present; only legacy hits without an owner use `CatalogStore::session_of`.
+  Display, grouping and repository boost must refer to that same owner. Signal
+  weights are unchanged. The `search-v2-rrf60-signals-v3-matched-owner` digest
+  invalidates pre-fix search cursors so pagination cannot silently mix old and
+  corrected rankings; list cursors retain their existing contract.
 - System-noise messages (payload `role` system/developer) are excluded from
   search by default; `include_system: true` opts back in. `group_by_session`
   collapses hits per session over a bounded scan window: the best-scoring hit
@@ -294,3 +305,47 @@ Correct: receive time and ownership digests through explicit arguments.
 ---
 
 **Language**: All documentation in **English**.
+
+## Scenario: Verified model manifests and bounded handoff output
+
+### 1. Scope / Trigger
+Local bundle verification/import and deterministic cross-boundary handoff generation.
+
+### 2. Signatures
+`read_and_verify_bundle(&Path) -> PortResult<ModelBundleManifest>`;
+`generate_deterministic(HandoffInput<'_>) -> PortResult<HandoffPack>`.
+
+### 3. Contracts
+A manifest covers config.json, tokenizer.json and model.safetensors with size/hash entries; MODEL-MANIFEST.json does not need a self-hash. Names are single safe path components and entries are unique. Verification is not proof that weights can be loaded or inference succeeds. The existing process-local load cache also caches failure: restart a long-lived caller after repairing/importing the bundle; automatic live reload is not implemented.
+Handoff `max_bytes` bounds the existing serialized content measure, excluding dropped/source locators and the used_bytes counter's self-reference. Recompute confidence, redaction status and token use before each byte check. Trim evidence/mainline together, then ancillary activities/session summaries if necessary; mandatory content that cannot fit returns InvalidRequest, never oversized Partial. Empty retained evidence means Low. Identity hash revision `handoff-pack/identity-v2` uses labeled JSON inputs, including target, optional fields and budgets; the pack schema/wire prefix remain v1.
+
+### 4. Validation & Error Matrix
+Missing/duplicate/unsafe manifest entry or wrong size/hash -> verification error. Valid integrity with unsupported model/dimension -> loader error. Required handoff content too large -> InvalidRequest. Successful truncation -> bounded pack with truthful reason/count and retained confidence.
+
+### 5. Good/Base/Bad Cases
+Good: every required file is hashed and a bounded pack retains evidence. Base: an empty result has Low confidence. Bad: accepting files:[] or keeping High after all evidence was removed.
+
+### 6. Tests Required
+Application all-feature tests: required-content coverage, duplicate/size/hash failures; long mandatory query, oversized activity metadata, post-trim confidence and since/until/None/empty/query-provider identity separation. CLI and MCP must propagate the fallible generator through existing structured errors.
+
+### 7. Wrong vs Correct
+Wrong: treat file existence as verification, or stop trimming merely because evidence is empty.
+Correct: prove manifest coverage, check every retained content field, and reject irreducible overflow.
+
+## Scenario: Read request consistency
+1. **Scope:** all current AppRequest variants are read-only.
+2. **Signature:** `App::handle` acquires `catalog.begin_read_snapshot()` before request reads.
+3. **Contract:** generation, readiness/query, payload, ownership, graph and resume reads use the shared backend session. The guard survives through response assembly and drops on success/error/unwind; outer composition guards may extend the same view.
+4. **Errors:** acquisition errors remain AppError::Port; invalid cursor/budget paths still release the scope.
+5. **Cases:** a racing writer cannot pair old generation with new payload; a later request observes the new generation.
+6. **Tests:** adapter/application WAL integration injects commits before query and before payload/ownership, plus early errors and unwinding.
+7. **Boundary:** if a future AppRequest writes data, it must not inherit this read-only scope accidentally. Model embedding and interactive execution stay outside App read assembly.
+
+## Scenario: Requested vector and fallback cursors
+1. **Scope:** semantic/hybrid readiness selection and paginated fallback.
+2. **Signatures:** `App::handle`, `SemanticIndex::is_ready(query_dimension)`, `RetrievalBinding`, `search_query_digest`.
+3. **Contracts:** probe exactly the supplied query dimension once; missing embedding or pure lexical mode skips readiness. Bind the requested vector/dimension in semantic/hybrid cursor digests even when the effective mode is lexical_fallback. Keep requested/effective mode and selected model binding.
+4. **Errors:** changed fallback vector/dimension -> cursor_invalid; unchanged input continues normally. Readiness/backend errors and malformed matching vectors are not empty-success/fallback signals.
+5. **Cases:** 17-to-18 dimensions while both remain fallback must reject the old cursor; identical fallback input must advance the page.
+6. **Tests:** semantic and hybrid fallback-to-fallback changed dimension, changed same-dimension content and identical continuation; reference forwarding; absent-embedding probe count.
+7. **Wrong/right:** operational fallback does not make request identity irrelevant. Separate the requested input binding from the effective retrieval route.

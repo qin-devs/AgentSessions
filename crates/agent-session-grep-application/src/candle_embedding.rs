@@ -68,6 +68,10 @@ impl CandleE5Model {
     /// pays the ~seconds model-load cost; every later query reuses the cached
     /// encoder. One-shot CLI invocations still pay the load once per process —
     /// that cost is reported honestly by the benchmark, not hidden.
+    ///
+    /// The first load failure is also cached for this process. After importing
+    /// or repairing a bundle, restart a long-lived caller before retrying. This
+    /// does not persist failures across CLI invocations or process restarts.
     pub fn load_cached(dir: impl AsRef<Path>) -> PortResult<&'static CandleE5Model> {
         static CACHE: std::sync::OnceLock<Result<CandleE5Model, String>> =
             std::sync::OnceLock::new();
@@ -262,6 +266,30 @@ pub fn read_and_verify_bundle(dir: &Path) -> PortResult<ModelBundleManifest> {
         .map_err(|e| PortError::Backend(format!("read MODEL-MANIFEST.json: {e}")))?;
     let manifest: ModelBundleManifest = serde_json::from_str(&raw)
         .map_err(|e| PortError::Backend(format!("parse MODEL-MANIFEST.json: {e}")))?;
+    let mut declared = std::collections::BTreeSet::new();
+    for file in &manifest.files {
+        let mut components = Path::new(&file.name).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+            || file.name.contains(['\\', ':'])
+        {
+            return Err(PortError::Backend(
+                "model bundle manifest contains an unsafe file name".into(),
+            ));
+        }
+        if !declared.insert(file.name.as_str()) {
+            return Err(PortError::Backend(
+                "model bundle manifest contains duplicate file entries".into(),
+            ));
+        }
+    }
+    for required in REQUIRED_BUNDLE_FILES {
+        if *required != "MODEL-MANIFEST.json" && !declared.contains(required) {
+            return Err(PortError::Backend(format!(
+                "model bundle manifest missing required content entry `{required}`"
+            )));
+        }
+    }
     for file in &manifest.files {
         let path = dir.join(&file.name);
         let data =
@@ -492,6 +520,39 @@ mod tests {
         let err = read_and_verify_bundle(&dir).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("missing required file"), "{msg}");
+    }
+
+    #[test]
+    fn verify_bundle_requires_hash_coverage_for_every_content_file() {
+        for omitted in [
+            None,
+            Some("config.json"),
+            Some("tokenizer.json"),
+            Some("model.safetensors"),
+        ] {
+            let dir = tempfile_dir();
+            write_minimal_bundle(&dir);
+            let mut manifest = read_manifest(&dir);
+            match omitted {
+                None => manifest.files.clear(),
+                Some(name) => manifest.files.retain(|file| file.name != name),
+            }
+            write_manifest(&dir, &manifest);
+            assert!(
+                read_and_verify_bundle(&dir).is_err(),
+                "accepted missing coverage: {omitted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_bundle_rejects_duplicate_manifest_entries() {
+        let dir = tempfile_dir();
+        write_minimal_bundle(&dir);
+        let mut manifest = read_manifest(&dir);
+        manifest.files.push(manifest.files[0].clone());
+        write_manifest(&dir, &manifest);
+        assert!(read_and_verify_bundle(&dir).is_err());
     }
 
     #[test]

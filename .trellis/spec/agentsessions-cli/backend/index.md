@@ -441,3 +441,38 @@ Correct: ask the adapter manifest what the provider streams, and let the stored
 scan rows decide whether an empty source is a no-op or a replacement.
 
 **Language**: write all guideline docs in **English**.
+
+## Scenario: Resume boundary and immutable release quality
+
+### 1. Scope / Trigger
+CLI/HTTP resume previews, machine execution, and reusable release CI.
+
+### 2. Signatures
+`preview_resume(&SqliteStore, &str)` returns the ordinary outcome/data/page/warnings tuple without acknowledgement. CLI resume shares `load_resume_preview`; machine --yes execution is rejected. Reusable ci.yml accepts optional string `source_commit` and resolves a full SHA in the source job.
+
+### 3. Contracts
+Validate native session IDs through the checked domain contract and reject leading hyphens before descriptor construction. Human execution retains its terminal and first-preview gate; do not route it through null stdio. HTTP GET neither creates nor consumes CLI acknowledgement, and HTTP POST remains unsupported. Unknown CLI command names are canonicalized to unknown; machine diagnostics/progress free text is redacted before bounding. Preserve request correlation/page tokens and existing local Human rendering policy. Diagnostic redaction must retain its actual status/count through envelope construction; scanning already-redacted text again cannot recover that accounting. Test both the machine envelope metadata and Human diagnostics, not only a redaction helper.
+Release prepare resolves source_commit; quality, build and assemble consume that same immutable commit. All reusable quality jobs depend on source and checkout its SHA. MSRV is explicitly 1.90.0, including all features/targets. Existing-tag dispatch remains artifact-only; no tag-free rehearsal or automatic official release is implied.
+Synthetic release verification isolates platform home/config/data/cache paths in each child process, not just the catalog, so installed user models cannot change its bigram-hash expectations. Never change the parent environment or user configuration. Hook verification observes the bare hook protocol: disabled hooks must exit successfully with exactly empty stdout, not a JSON envelope; diagnostic stderr is allowed.
+
+### 4. Validation & Error Matrix
+Option-like native ID -> unavailable descriptor with no executable argv. Machine --yes -> structured invalid_request without spawn. GET preview -> no ack state change. Invalid non-SHA quality input -> source job fails before consumers. Build/assembly never re-resolve a mutable tag.
+
+### 5. Good/Base/Bad Cases
+Good: Human fake-provider round trip uses exact argv after preview. Base: machine caller previews only. Bad: GET acknowledges a CLI confirmation, or green trigger-branch tests bless a different tag's build.
+
+### 6. Tests Required
+Boundary units and fake-provider e2e cover no-spawn, valid argv, mode isolation and free-text redaction/correlation. HTTP regression proves repeatable GET and separate CLI acknowledgement; existing POST/CSRF checks remain. Workflow tests enforce quality/build/assemble/source checkout and the MSRV command. Controlled remote mismatch rehearsal is a separate pending release gate.
+
+### 7. Wrong vs Correct
+Wrong: infer safe argv from shell quoting, or use the dispatch branch for release quality.
+Correct: validate operands before preview/execute and bind every release consumer to prepare's SHA.
+
+## Scenario: Composite read response snapshots
+1. **Scope:** Human search rows, CLI/MCP handoff evidence and doctor counters extend beyond a single App call.
+2. **Signature:** use the store's nestable `begin_read_snapshot` around App plus all subsequent DB projection reads.
+3. **Contract:** prepare model/query embeddings first. Human search retains its view through resume/date rows; handoff retains it through source locators, activities and message facts, then releases before pack formatting. Doctor protects its direct multi-counter projection. Ordinary App calls rely on App's guard.
+4. **Errors:** map acquisition errors through existing protocol/business mappings. Early failures release the view before the next command.
+5. **Cases:** generation and evidence refer to one view; resume confirmation, child process execution and output/transport waits never retain a guard.
+6. **Tests:** CLI Human search/handoff/doctor and MCP handoff success/error paths permit a subsequent write; core WAL tests prove nested view consistency.
+7. **Wrong/right:** wrapping App alone leaves post-response DB reads unprotected; extend only the composite read region, never the whole command/server lifetime.

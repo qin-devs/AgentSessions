@@ -1,0 +1,153 @@
+{
+  "fixture_revision": 1,
+  "ItemTable": {
+    "workbench.panel.aichat.view.aichat.chatdata": {
+      "tabs": [
+        {
+          "id": "timestamp-tab",
+          "createdAt": 1704067200000,
+          "bubbles": [
+            {
+              "type": "assistant",
+              "text": "chat until",
+              "timingInfo": {
+                "startTime": 1704067200124
+              }
+            },
+            {
+              "type": "user",
+              "text": "chat since",
+              "timingInfo": {
+                "startTime": 1704067200123
+              }
+            },
+            {
+              "type": "user",
+              "text": "chat before",
+              "timingInfo": {
+                "startTime": 1704067200122
+              }
+            },
+            {
+              "type": "user",
+              "text": "epoch after",
+              "timingInfo": {
+                "startTime": 1
+              }
+            },
+            {
+              "type": "user",
+              "text": "epoch before",
+              "timingInfo": {
+                "startTime": -1
+              }
+            },
+            {
+              "type": "user",
+              "text": "epoch zero",
+              "timingInfo": {
+                "startTime": 0
+              }
+            },
+            {
+              "type": "user",
+              "text": "chat null",
+              "timingInfo": {
+                "startTime": null
+              }
+            },
+            {
+              "type": "user",
+              "text": "chat missing"
+            }
+          ]
+        }
+      ]
+    },
+    "aiService.prompts": [
+      {
+        "conversationId": "timestamp-prompts",
+        "createdAt": 1704067200124,
+        "prompt": "prompt until"
+      },
+      {
+        "conversationId": "timestamp-prompts",
+        "createdAt": 1704067200123,
+        "prompt": "prompt since",
+        "response": "response since"
+      },
+      {
+        "conversationId": "timestamp-prompts",
+        "createdAt": 1704067200122,
+        "prompt": "prompt before"
+      },
+      {
+        "conversationId": "timestamp-prompts",
+        "createdAt": null,
+        "prompt": "prompt null"
+      },
+      {
+        "conversationId": "timestamp-prompts",
+        "prompt": "prompt missing"
+      }
+    ]
+  },
+  "cursorDiskKV": {
+    "composerData:timestamp-composer": {
+      "createdAt": 1704067200000,
+      "fullConversationHeadersOnly": [
+        {
+          "bubbleId": "later",
+          "type": 2
+        },
+        {
+          "bubbleId": "precise",
+          "type": 1
+        },
+        {
+          "bubbleId": "since",
+          "type": 1
+        },
+        {
+          "bubbleId": "since",
+          "type": 1
+        },
+        {
+          "bubbleId": "before",
+          "type": 1
+        },
+        {
+          "bubbleId": "null",
+          "type": 1
+        },
+        {
+          "bubbleId": "missing",
+          "type": 1
+        }
+      ]
+    },
+    "bubbleId:timestamp-composer:before": {
+      "text": "disk before",
+      "createdAt": "2024-01-01T00:00:00.122Z"
+    },
+    "bubbleId:timestamp-composer:since": {
+      "text": "disk since",
+      "createdAt": "2024-01-01T00:00:00.123Z"
+    },
+    "bubbleId:timestamp-composer:precise": {
+      "text": "  disk precise 雪  ",
+      "createdAt": "2024-01-01T01:00:00.123456789+01:00"
+    },
+    "bubbleId:timestamp-composer:later": {
+      "text": "disk until",
+      "createdAt": "2024-01-01T00:00:00.124Z"
+    },
+    "bubbleId:timestamp-composer:null": {
+      "text": "disk null",
+      "createdAt": null
+    },
+    "bubbleId:timestamp-composer:missing": {
+      "text": "disk missing"
+    }
+  }
+}

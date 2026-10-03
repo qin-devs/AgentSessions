@@ -810,14 +810,19 @@ pub fn route_request(
         return fixed_error(404, "not_found", "HTTP route not found");
     }
 
-    match crate::dispatch(
-        store,
-        db,
-        &args,
-        crate::protocol::OutputMode::Json,
-        None,
-        offline,
-    ) {
+    let result = match args.as_slice() {
+        [command, session] if command == "resume" => crate::preview_resume(store, session)
+            .map(|(outcome, data, page, warnings)| ("resume", outcome, data, page, warnings)),
+        _ => crate::dispatch(
+            store,
+            db,
+            &args,
+            crate::protocol::OutputMode::Json,
+            None,
+            offline,
+        ),
+    };
+    match result {
         Ok((command, outcome, mut data, page, warnings)) => {
             if command == "status"
                 && let Some(data) = data.as_object_mut()
@@ -1121,6 +1126,73 @@ mod tests {
                 ("Host".into(), "127.0.0.1:8080".into()),
             ],
         )
+    }
+
+    #[test]
+    fn resume_get_is_stateless_and_preserves_cli_preview_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("session.jsonl");
+        let db = dir.path().join("catalog.sqlite3");
+        std::fs::write(
+            &source,
+            serde_json::json!({
+                "type": "user", "uuid": "synthetic-message",
+                "sessionId": "synthetic-web-session", "cwd": dir.path().to_str().unwrap(),
+                "message": {"role": "user", "content": "synthetic preview"}
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+        crate::ingest_file(&store, source.to_str().unwrap()).unwrap();
+        let sessions = agent_session_grep_ports::CatalogStore::list_sessions(&store, 10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = sessions[0].id.as_str();
+        let path = format!("/api/resume?session={session}");
+        let ack = agent_session_grep_application::resume::resume_preview_ack_path(dir.path());
+        assert!(!ack.exists());
+        let first = route_request(
+            &authorized("GET", &path),
+            TEST_TOKEN,
+            db.to_str().unwrap(),
+            true,
+            &store,
+        );
+        assert_eq!(first.status, 200, "{}", first.body);
+        assert!(!ack.exists(), "HTTP GET must not acknowledge a CLI preview");
+        let second = route_request(
+            &authorized("GET", &path),
+            TEST_TOKEN,
+            db.to_str().unwrap(),
+            true,
+            &store,
+        );
+        assert_eq!(first.body, second.body);
+        let (_, _, data, _, _) = crate::dispatch(
+            &store,
+            db.to_str().unwrap(),
+            &["resume".into(), session.into()],
+            crate::protocol::OutputMode::Human,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(data["available"], true);
+        assert_eq!(data["executed"], false);
+        assert!(ack.exists(), "the CLI still owns its acknowledgement gate");
+        let third = route_request(
+            &authorized("GET", &path),
+            TEST_TOKEN,
+            db.to_str().unwrap(),
+            true,
+            &store,
+        );
+        assert_eq!(first.body, third.body);
+        assert!(
+            ack.exists(),
+            "HTTP GET must not consume CLI acknowledgement"
+        );
     }
 
     fn start_test_server(

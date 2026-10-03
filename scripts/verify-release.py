@@ -9,7 +9,8 @@ provider capability matrix. The local loopback serve surface is intentionally
 out of scope; it has a dedicated smoke harness (the five-entry-point
 consistency harness exercises it for real).
 
-Note on "semantic": the shipped vectorizer is ``bigram-hash-v1``, a fuzzy
+Note on "semantic": this check isolates the local model cache and exercises
+``bigram-hash-v1``, a fuzzy
 lexical bigram hash — explicitly NOT a semantic model. The check verifies the
 semantic/hybrid effective modes are reachable and correctly labelled, not that
 the project performs semantic retrieval.
@@ -63,16 +64,23 @@ def parse_first_json_line(output: str) -> dict[str, Any]:
     raise VerificationError("expected a JSON frame on stdout")
 
 
-def run_asg(
+def run_asg_raw(
     asg_bin: str,
     data_root: str,
     args: list[str],
     *,
     stdin: str | None = None,
-) -> dict[str, Any]:
-    """Run asg with --output json and return the first parsed frame."""
+) -> subprocess.CompletedProcess[str]:
+    """Run against synthetic state, preserving raw stdout for hook checks."""
     env = os.environ.copy()
     env["ASG_DATA_ROOT"] = data_root
+    # --db isolates the catalog, not platform config/model discovery. Keep
+    # installed user models out of this deterministic bigram-hash smoke.
+    for key in (
+        "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+        "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+    ):
+        env[key] = str(Path(data_root) / key.lower())
     db = str(Path(data_root) / "asg.db")
     result = subprocess.run(
         [asg_bin, "--db", db, "--output", "json"] + args,
@@ -87,6 +95,18 @@ def run_asg(
             f"command {' '.join(args)} exited {result.returncode}: "
             f"{result.stderr.strip()}"
         )
+    return result
+
+
+def run_asg(
+    asg_bin: str,
+    data_root: str,
+    args: list[str],
+    *,
+    stdin: str | None = None,
+) -> dict[str, Any]:
+    """Run an enveloped command and return the first parsed JSON frame."""
+    result = run_asg_raw(asg_bin, data_root, args, stdin=stdin)
     return parse_first_json_line(result.stdout)
 
 
@@ -228,17 +248,15 @@ def verify_semantic(asg_bin: str, data_root: str) -> bool:
 
 
 def verify_hook(asg_bin: str, data_root: str) -> bool:
-    disabled = run_asg(
+    result = run_asg_raw(
         asg_bin,
         data_root,
         ["hook", "user-prompt-submit"],
         stdin='{"prompt":"retry"}',
-    )["data"]
-    ok = (
-        disabled.get("enabled") is False
-        and disabled.get("hookSpecificOutput", {}).get("additionalContext") == ""
     )
-    return step("hook off by default", ok, f"enabled={disabled.get('enabled')}")
+    # Hooks use bare hook protocol, not a CLI envelope. Disabled means no
+    # stdout at all; even whitespace would be injected into the host context.
+    return step("hook off by default", result.stdout == "", f"stdout_empty={result.stdout == ''}")
 
 
 def verify_providers(asg_bin: str, data_root: str) -> bool:

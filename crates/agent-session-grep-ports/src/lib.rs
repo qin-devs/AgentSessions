@@ -91,10 +91,27 @@ pub struct CatalogEntry {
     pub payload: Vec<u8>,
 }
 
+/// A request-scoped, already pinned read view. Dropping the last nested guard
+/// releases the view, including on early return or unwinding. Implementations
+/// must not retain an interior-mutability borrow across other port calls.
+/// Keep this guard out of writes, prompts, model loading and network waits.
+pub trait ReadSnapshot {}
+
+impl ReadSnapshot for () {}
+
 /// 目录存储端口：规范化实体的持久化目录（对应 SQLite catalog）。
 ///
 /// 只暴露按 StableId 存取及稳定排序列表；全文查询能力由 SearchIndex 承担。
 pub trait CatalogStore {
+    /// Pin the shared catalog/search/context/resume read view before any read.
+    /// All mutable data ports in one request must use this same backend session.
+    /// Nested guards share the view until the last guard drops (not just LIFO).
+    /// The default is only suitable for immutable/in-memory request fixtures;
+    /// mutable persistent adapters must override it, as must forwarding wrappers.
+    fn begin_read_snapshot(&self) -> PortResult<Box<dyn ReadSnapshot + '_>> {
+        Ok(Box::new(()))
+    }
+
     /// 按 StableId 取回已规范化实体的原始 JSON 负载。
     fn get(&self, id: &StableId) -> PortResult<Option<Vec<u8>>>;
 
@@ -785,9 +802,10 @@ pub trait SemanticIndex {
         include_system: bool,
     ) -> PortResult<Vec<SearchHit>>;
 
-    /// 语义索引是否就绪（模型已加载、向量索引已建）。
+    /// Whether the selected model has live catalog vectors of the query dimension.
+    /// Zero is never ready.
     /// Only `Ok(false)` permits lexical fallback; backend errors propagate.
-    fn is_ready(&self) -> PortResult<bool>;
+    fn is_ready(&self, query_dimension: usize) -> PortResult<bool>;
 
     /// Current model identity for cursor binding; errors must not be hidden.
     fn semantic_model_id(&self) -> PortResult<Option<String>>;
@@ -815,7 +833,7 @@ impl SemanticIndex for NoSemanticIndex {
         Ok(Vec::new())
     }
 
-    fn is_ready(&self) -> PortResult<bool> {
+    fn is_ready(&self, _query_dimension: usize) -> PortResult<bool> {
         Ok(false)
     }
 
@@ -859,6 +877,10 @@ pub struct EmbeddingManifest {
 // 用共享引用同时填充 App<C,S> 的两个泛型槽（catalog 与 index 是同一实例）。
 // 组合根据此复用单一 SqliteStore，无需两份连接或内部 Arc。
 impl<T: CatalogStore + ?Sized> CatalogStore for &T {
+    fn begin_read_snapshot(&self) -> PortResult<Box<dyn ReadSnapshot + '_>> {
+        (**self).begin_read_snapshot()
+    }
+
     fn get(&self, id: &StableId) -> PortResult<Option<Vec<u8>>> {
         (**self).get(id)
     }
@@ -1228,8 +1250,8 @@ impl<T: SemanticIndex + ?Sized> SemanticIndex for &T {
         (**self).query_semantic_filtered(query_embedding, limit, filters, facets, include_system)
     }
 
-    fn is_ready(&self) -> PortResult<bool> {
-        (**self).is_ready()
+    fn is_ready(&self, query_dimension: usize) -> PortResult<bool> {
+        (**self).is_ready(query_dimension)
     }
 
     fn semantic_model_id(&self) -> PortResult<Option<String>> {
@@ -2091,6 +2113,52 @@ mod tests {
             ..SearchFilters::default()
         };
         assert!(!repo_only.is_empty());
+    }
+
+    #[test]
+    fn semantic_index_reference_forwards_dimension_and_errors() {
+        struct DimensionIndex;
+        impl SemanticIndex for DimensionIndex {
+            fn index_embedding(&self, _id: &StableId, _embedding: &[f32]) -> PortResult<()> {
+                Ok(())
+            }
+            fn query_semantic_filtered(
+                &self,
+                _embedding: &[f32],
+                _limit: usize,
+                _filters: &SearchFilters,
+                _facets: &SearchFacets,
+                _include_system: bool,
+            ) -> PortResult<Vec<SearchHit>> {
+                Ok(Vec::new())
+            }
+            fn is_ready(&self, dimension: usize) -> PortResult<bool> {
+                if dimension == 4 {
+                    Err(PortError::WriterBusy(
+                        "synthetic readiness contention".into(),
+                    ))
+                } else {
+                    Ok(dimension == 3)
+                }
+            }
+            fn semantic_model_id(&self) -> PortResult<Option<String>> {
+                Ok(Some("dimension-model".into()))
+            }
+        }
+        let index = &DimensionIndex;
+        assert!(SemanticIndex::is_ready(&index, 3).unwrap());
+        assert!(!SemanticIndex::is_ready(&index, 2).unwrap());
+        assert!(matches!(
+            SemanticIndex::is_ready(&index, 4),
+            Err(PortError::WriterBusy(_))
+        ));
+        assert_eq!(
+            SemanticIndex::semantic_model_id(&index).unwrap().as_deref(),
+            Some("dimension-model")
+        );
+        for dimension in [0, 2, 3] {
+            assert!(!SemanticIndex::is_ready(&NoSemanticIndex, dimension).unwrap());
+        }
     }
 
     struct FakeContextStore {

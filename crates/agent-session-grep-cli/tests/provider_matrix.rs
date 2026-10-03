@@ -233,7 +233,7 @@ fn beta_ledger_ids(section: &str) -> Vec<String> {
 #[test]
 fn beta_readiness_manifests_match_ledger_evidence_columns() {
     // ledger 的本地列（golden / local Beta blockers）与全局 blocker 必须与真实
-    // adapter manifest 一致：golden fixture revision 1、无跨平台认证 target、
+    // adapter manifest 一致：Cline fixture revision 2、其余 1，无跨平台认证 target、
     // maturity=Experimental、known_limitations 非空。manifest() 经由 manifest_for
     // 携带各 adapter 自己的声明，因此空限制声明/伪造 revision 会在此失败。
     let ledger_rows = beta_ledger_rows("Per-provider local readiness");
@@ -250,10 +250,11 @@ fn beta_readiness_manifests_match_ledger_evidence_columns() {
     for adapter in &adapters {
         let manifest = adapter.manifest();
         let id = manifest.provider_id.as_str();
+        let expected_revision = if id == "cline" { 2 } else { 1 };
         assert_eq!(
             manifest.fixture_revision,
-            Some(1),
-            "{id}: golden fixture revision 必须为 Some(1)"
+            Some(expected_revision),
+            "{id}: golden fixture revision must match its pinned fixture set"
         );
         assert!(
             manifest.last_certified_targets.is_empty(),

@@ -85,15 +85,44 @@ class VerifyReleaseTests(unittest.TestCase):
         with mock.patch.object(verify_release, "run_asg", side_effect=lambda *args, **kwargs: next(frames)):
             self.assertFalse(verify_release.verify_handoff("synthetic-binary", "synthetic-root"))
 
-    def test_hook_default_check_rejects_nonempty_context(self) -> None:
-        frame = {
-            "data": {
-                "enabled": False,
-                "hookSpecificOutput": {"additionalContext": "unexpected history"},
-            }
-        }
-        with mock.patch.object(verify_release, "run_asg", return_value=frame):
-            self.assertFalse(verify_release.verify_hook("synthetic-binary", "synthetic-root"))
+    def test_subprocess_isolates_platform_paths_without_changing_parent(self) -> None:
+        keys = (
+            "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+        )
+        ambient = {key: "synthetic-ambient-" + key for key in keys}
+        result = subprocess.CompletedProcess([], 0, '{"data":{}}', "")
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.dict(os.environ, ambient):
+                parent = dict(os.environ)
+                with mock.patch.object(verify_release.subprocess, "run", return_value=result) as run:
+                    verify_release.run_asg("synthetic-binary", root, ["index", "embeddings"])
+                child = run.call_args.kwargs["env"]
+                for key in keys:
+                    self.assertTrue(Path(child[key]).is_relative_to(Path(root)), key)
+                    self.assertNotEqual(child[key], ambient[key])
+                self.assertEqual(dict(os.environ), parent)
+                self.assertEqual(run.call_args.args[0][1:3], ["--db", str(Path(root) / "asg.db")])
+
+    def test_hook_default_accepts_empty_stdout_and_diagnostic_stderr(self) -> None:
+        result = subprocess.CompletedProcess(
+            [], 0, "", "hook: event=UserPromptSubmit enabled=false offline=false hits=0 injected=false\n"
+        )
+        with mock.patch.object(verify_release.subprocess, "run", return_value=result):
+            self.assertTrue(verify_release.verify_hook("synthetic-binary", "synthetic-root"))
+
+    def test_hook_default_rejects_any_stdout(self) -> None:
+        for output in (" \n", "unexpected history", '{"data":{"enabled":false}}'):
+            with self.subTest(output=output):
+                result = subprocess.CompletedProcess([], 0, output, "")
+                with mock.patch.object(verify_release.subprocess, "run", return_value=result):
+                    self.assertFalse(verify_release.verify_hook("synthetic-binary", "synthetic-root"))
+
+    def test_hook_default_rejects_nonzero_exit_even_with_empty_stdout(self) -> None:
+        result = subprocess.CompletedProcess([], 2, "", "synthetic failure")
+        with mock.patch.object(verify_release.subprocess, "run", return_value=result):
+            with self.assertRaises(verify_release.VerificationError):
+                verify_release.verify_hook("synthetic-binary", "synthetic-root")
 
     def test_parse_first_json_line_ignores_blank_lines(self) -> None:
         self.assertEqual(

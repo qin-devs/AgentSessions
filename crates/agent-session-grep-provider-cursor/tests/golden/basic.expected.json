@@ -10,7 +10,7 @@
       "seq": 0,
       "span": null,
       "text": "hello",
-      "timestamp": "101"
+      "timestamp": "1970-01-01T00:00:00.101Z"
     },
     {
       "is_sidechain": false,
@@ -20,7 +20,7 @@
       "seq": 1,
       "span": null,
       "text": "hi there",
-      "timestamp": "102"
+      "timestamp": "1970-01-01T00:00:00.102Z"
     },
     {
       "is_sidechain": false,
@@ -30,7 +30,7 @@
       "seq": 2,
       "span": null,
       "text": "raw only",
-      "timestamp": "150"
+      "timestamp": "1970-01-01T00:00:00.150Z"
     },
     {
       "is_sidechain": false,
@@ -40,7 +40,7 @@
       "seq": 3,
       "span": null,
       "text": "q1",
-      "timestamp": "200"
+      "timestamp": "1970-01-01T00:00:00.200Z"
     },
     {
       "is_sidechain": false,
@@ -50,7 +50,7 @@
       "seq": 4,
       "span": null,
       "text": "a1",
-      "timestamp": "200"
+      "timestamp": "1970-01-01T00:00:00.200Z"
     },
     {
       "is_sidechain": false,
@@ -60,7 +60,7 @@
       "seq": 5,
       "span": null,
       "text": "q2",
-      "timestamp": "201"
+      "timestamp": "1970-01-01T00:00:00.201Z"
     }
   ],
   "session_native_id": "tab-1",

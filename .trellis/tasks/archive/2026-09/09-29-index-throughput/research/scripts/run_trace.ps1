@@ -5,7 +5,7 @@ param(
   [int]$MaxSourcesPerBatch = 40
 )
 $ErrorActionPreference = 'Stop'
-$ws = 'C:/AgentSessions-worktrees/post-reuse-phase'
+$ws = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../../../../../../..')).Path
 $bin = "$ws/target/release/agent-session-grep.exe"
 New-Item -ItemType Directory -Force -Path $DbDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TraceFile) | Out-Null

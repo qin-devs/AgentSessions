@@ -406,7 +406,7 @@ fn unchanged_version_two_state_db_reparses_completeness_once() {
         conn.query_row("SELECT parser_version FROM source_scans", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        3
+        i64::from(agent_session_grep_adapters_sqlite::PARSER_SEMANTIC_VERSION)
     );
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM source_relation_scans", [], |r| r

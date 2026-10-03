@@ -2,7 +2,7 @@
 //!
 //! Two mutually exclusive variants:
 //!
-//! * `cursor/vscdb-chat-v1` (unchanged): `state.vscdb` ItemTable KV keys
+//! * `cursor/vscdb-chat-v1` (legacy): `state.vscdb` ItemTable KV keys
 //!   `workbench.panel.aichat.view.aichat.chatdata` (tabs -> bubbles) and
 //!   `aiService.prompts` (flat prompt/response history).
 //! * `cursor/disk-kv-v1` (see [`disk_kv`]): the newer `cursorDiskKV` table
@@ -11,8 +11,9 @@
 //! Variant dispatch is decided by the bytes alone: a SQLite stream can claim
 //! the ItemTable surface, the disk-kv surface, or neither, and a stream that
 //! satisfies both is refused as ambiguous instead of guessed. Everything the
-//! ItemTable variant accepted before behaves byte-for-byte as before - the
-//! disk-kv path is additive.
+//! ItemTable variant accepted before retains its text, identity and order;
+//! its numeric message timestamps are normalized from the proven millisecond
+//! unit. The disk-kv path is additive.
 //!
 //! Both variants receive the SQLite file as a byte stream, write it to a
 //! private temporary file, and open that copy read-only
@@ -224,7 +225,7 @@ fn item_table_claim(conn: &Connection) -> bool {
         && (key_exists(conn, CHAT_DATA_KEY) || key_exists(conn, PROMPTS_KEY))
 }
 
-/// Parse the ItemTable surface (`cursor/vscdb-chat-v1`, unchanged).
+/// Parse the ItemTable surface (`cursor/vscdb-chat-v1`).
 fn parse_item_table(
     conn: &Connection,
     sink: &mut dyn CanonicalEventSink,
@@ -320,15 +321,7 @@ fn parse_chat_data(
         // Chronological order within the tab by bubble start time.
         bubbles.sort_by_key(|(_, _, start)| start.unwrap_or(i64::MAX));
         for (text, role, start) in bubbles {
-            emit_message(
-                sink,
-                report,
-                seq,
-                &role,
-                &text,
-                start.map(|t| t.to_string()),
-                &session,
-            )?;
+            emit_message(sink, report, seq, &role, &text, start, &session)?;
         }
     }
     Ok(())
@@ -394,15 +387,7 @@ fn parse_prompts(
         let id = (!conversation_id.trim().is_empty()).then_some(conversation_id.as_str());
         let session = register_session(report, session_count, id);
         for (role, text, created_at) in messages {
-            emit_message(
-                sink,
-                report,
-                seq,
-                &role,
-                &text,
-                created_at.map(|t| t.to_string()),
-                &session,
-            )?;
+            emit_message(sink, report, seq, &role, &text, created_at, &session)?;
         }
     }
     Ok(())
@@ -436,20 +421,54 @@ fn register_session(
     }
 }
 
-/// Emit one canonical message with a document-stable synthetic native id.
-///
-/// Bubbles and prompt records carry no per-message id (a tab id or prompt id
-/// is shared by several messages), so a sequence-derived id is used, same as
-/// the cline/codebuddy/qoder adapters.
+/// Format a proven ItemTable epoch-millisecond field without floating-point
+/// rounding or magnitude-based unit inference. The civil-from-days algorithm
+/// is the inverse of the Gregorian day calculation used by the time readers.
+/// Use the four-digit ISO year form; the caller diagnoses values outside it.
+fn format_epoch_millis_utc(millis: i64) -> Option<String> {
+    let seconds = millis.div_euclid(1_000);
+    let subsecond = millis.rem_euclid(1_000);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let days = seconds.div_euclid(86_400) + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let march_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * march_month + 2) / 5 + 1;
+    let month = march_month + if march_month < 10 { 3 } else { -9 };
+    let year = era * 400 + year_of_era + i64::from(month <= 2);
+    if !(0..=9999).contains(&year) {
+        return None;
+    }
+    let (hour, minute, second) = (day_seconds / 3_600, day_seconds / 60 % 60, day_seconds % 60);
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{subsecond:03}Z"
+    ))
+}
+
+/// Emit one ItemTable message without inventing a native id. Raw epoch values
+/// have already determined its ordinal; formatting must never change that
+/// order or omit the message when a timestamp cannot be represented.
 fn emit_message(
     sink: &mut dyn CanonicalEventSink,
     report: &mut ParseReport,
     seq: &mut u32,
     role: &str,
     text: &str,
-    timestamp: Option<String>,
+    timestamp: Option<i64>,
     session: &agent_session_grep_ports::ProviderSessionIdentity,
 ) -> Result<(), ProviderError> {
+    let timestamp = timestamp.and_then(|millis| {
+        let formatted = format_epoch_millis_utc(millis);
+        if formatted.is_none() {
+            report
+                .diagnostics
+                .push("cursor ItemTable: out-of-range epoch-millisecond timestamp omitted".into());
+        }
+        formatted
+    });
     sink.emit_message(MessageEvent {
         session: Some(session),
         seq: *seq,
@@ -906,11 +925,17 @@ mod tests {
         assert_eq!(sink.events[0].0, 0);
         assert_eq!(sink.events[0].1, "user");
         assert_eq!(sink.events[0].2, "hello");
-        assert_eq!(sink.events[0].3.as_deref(), Some("101"));
+        assert_eq!(
+            sink.events[0].3.as_deref(),
+            Some("1970-01-01T00:00:00.101Z")
+        );
         assert_eq!(sink.events[1].0, 1);
         assert_eq!(sink.events[1].1, "assistant");
         assert_eq!(sink.events[1].2, "hi there");
-        assert_eq!(sink.events[1].3.as_deref(), Some("102"));
+        assert_eq!(
+            sink.events[1].3.as_deref(),
+            Some("1970-01-01T00:00:00.102Z")
+        );
     }
 
     #[test]
@@ -966,8 +991,14 @@ mod tests {
             sink.events.iter().map(|e| e.2.as_str()).collect::<Vec<_>>(),
             ["q1", "a1", "q2", "a3"]
         );
-        assert_eq!(sink.events[1].3.as_deref(), Some("100"));
-        assert_eq!(sink.events[3].3.as_deref(), Some("300"));
+        assert_eq!(
+            sink.events[1].3.as_deref(),
+            Some("1970-01-01T00:00:00.100Z")
+        );
+        assert_eq!(
+            sink.events[3].3.as_deref(),
+            Some("1970-01-01T00:00:00.300Z")
+        );
     }
 
     #[test]

@@ -1362,6 +1362,377 @@ fn doctor_reports_ok_without_db() {
 }
 
 #[test]
+fn provider_epoch_millis_filters_and_parser_reparse_preserve_source_bytes() {
+    let instant = 1_735_689_600_000_i64;
+    for kind in ["cursor-chatdata", "cursor-prompts", "cline", "cline-bom"] {
+        let (dir, db) = temp_db("provider-time");
+        let source = dir.path().join(if kind.starts_with("cursor") {
+            "state.vscdb"
+        } else {
+            "api_conversation_history.json"
+        });
+        let records = [
+            (instant - 1, "timestampneedle before"),
+            (instant, "timestampneedle exact"),
+            (instant + 1, "timestampneedle until"),
+        ];
+        if kind.starts_with("cursor") {
+            let conn = Connection::open(&source).unwrap();
+            conn.execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT)")
+                .unwrap();
+            let (key, value) = if kind == "cursor-chatdata" {
+                (
+                    "workbench.panel.aichat.view.aichat.chatdata",
+                    serde_json::json!({"tabs":[{"id":"time-tab","createdAt":instant,"bubbles":records.iter().map(|(ts, text)| {
+                        serde_json::json!({"type":"user","text":text,"timingInfo":{"startTime":ts}})
+                    }).collect::<Vec<_>>()}]}),
+                )
+            } else {
+                (
+                    "aiService.prompts",
+                    serde_json::json!(records.iter().map(|(ts,text)| {
+                        serde_json::json!({"conversationId":"time-conversation","createdAt":ts,"prompt":text,"response":""})
+                    }).collect::<Vec<_>>()),
+                )
+            };
+            conn.execute(
+                "INSERT INTO ItemTable(key,value) VALUES(?1,?2)",
+                rusqlite::params![key, value.to_string()],
+            )
+            .unwrap();
+        } else {
+            let data = serde_json::to_vec(
+                &records
+                    .iter()
+                    .map(|(ts, text)| serde_json::json!({"role":"user","content":text,"ts":ts}))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let mut bytes = if kind == "cline-bom" {
+                vec![0xef, 0xbb, 0xbf]
+            } else {
+                Vec::new()
+            };
+            bytes.extend_from_slice(&data);
+            std::fs::write(&source, bytes).unwrap();
+        }
+        let original = std::fs::read(&source).unwrap();
+        let path = source.to_str().unwrap();
+        let out = run(&db, &["sync", path]);
+        assert!(out.status.success(), "{kind}: {}", stdout(&out));
+        let first = parse_first_line(&out);
+        let provider = if kind.starts_with("cursor") {
+            "cursor"
+        } else {
+            "cline"
+        };
+        let check_filtered = || {
+            let out = run(
+                &db,
+                &[
+                    "search",
+                    "timestampneedle",
+                    "--provider",
+                    provider,
+                    "--since",
+                    "2025-01-01T00:00:00Z",
+                    "--until",
+                    "2025-01-01T00:00:00.001Z",
+                ],
+            );
+            assert!(out.status.success(), "{kind}: {}", stdout(&out));
+            let frame = parse_first_line(&out);
+            let hits = frame["data"]["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 1, "{kind}: {frame}");
+            assert!(
+                hits[0]["text"].as_str().unwrap().contains("exact"),
+                "{kind}: {frame}"
+            );
+        };
+        check_filtered();
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("UPDATE source_scans SET parser_version=4", [])
+                .unwrap();
+        }
+        let out = run(&db, &["sync", path]);
+        assert!(out.status.success(), "{kind}: {}", stdout(&out));
+        let reparsed = parse_first_line(&out);
+        assert_eq!(
+            reparsed["data"]["generation"].as_u64().unwrap(),
+            first["data"]["generation"].as_u64().unwrap() + 1
+        );
+        assert!(
+            reparsed["data"]["emitted"].as_u64().unwrap() > 0,
+            "{kind}: {reparsed}"
+        );
+        let out = run(&db, &["sync", path]);
+        assert!(out.status.success(), "{kind}: {}", stdout(&out));
+        let repeated = parse_first_line(&out);
+        assert_eq!(
+            repeated["data"]["generation"], reparsed["data"]["generation"],
+            "{kind}: {repeated}"
+        );
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT parser_version FROM source_scans", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            version,
+            i64::from(agent_session_grep_adapters_sqlite::PARSER_SEMANTIC_VERSION)
+        );
+        check_filtered();
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            original,
+            "{kind}: source bytes changed"
+        );
+    }
+}
+
+#[test]
+fn cursor_identical_copies_reparse_legacy_timestamps_in_either_order() {
+    for [first, second] in [[0, 1], [1, 0]] {
+        let (dir, db) = temp_db("cursor-timestamp-rolling-upgrade");
+        let sources = [
+            dir.path().join("a/state.vscdb"),
+            dir.path().join("b/state.vscdb"),
+        ];
+        for source in &sources {
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        }
+        let millis = 1_735_689_600_123_i64;
+        let canonical = "2025-01-01T00:00:00.123Z";
+        {
+            let conn = Connection::open(&sources[0]).unwrap();
+            conn.execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT)")
+                .unwrap();
+            let value = serde_json::json!({"tabs":[{
+                "id":"rolling-time-tab", "createdAt":millis,
+                "bubbles":[{"type":"user", "text":"rollingepochneedle", "timingInfo":{"startTime":millis}}]
+            }]});
+            conn.execute(
+                "INSERT INTO ItemTable(key,value) VALUES(?1,?2)",
+                rusqlite::params![
+                    "workbench.panel.aichat.view.aichat.chatdata",
+                    value.to_string()
+                ],
+            )
+            .unwrap();
+        }
+        let original = std::fs::read(&sources[0]).unwrap();
+        std::fs::write(&sources[1], &original).unwrap();
+        let sync = |index: usize| {
+            let output = run(&db, &["sync", sources[index].to_str().unwrap()]);
+            assert!(output.status.success(), "{}", stdout(&output));
+            parse_first_line(&output)
+        };
+        sync(0);
+        let initial = sync(1);
+        let message: String = Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT id FROM catalog WHERE id LIKE 'msg_v1_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let observations = || {
+            let conn = Connection::open(&db).unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT source_path, id_json, payload, text FROM source_entity_projections WHERE entity_id=?1 ORDER BY source_path",
+            ).unwrap();
+            stmt.query_map([&message], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let new_evidence = observations();
+        assert_eq!(new_evidence.len(), 2);
+        for (index, (path, _, _, _)) in new_evidence.iter().enumerate() {
+            let suffix = if index == 0 {
+                "/a/state.vscdb"
+            } else {
+                "/b/state.vscdb"
+            };
+            assert!(path.replace('\\', "/").ends_with(suffix));
+        }
+        // Seed the actual parser-4 representation in the disposable catalog,
+        // not in either provider file. Preserve all non-timestamp evidence.
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            let tx = conn.transaction().unwrap();
+            let bytes: Vec<u8> = tx
+                .query_row(
+                    "SELECT payload FROM catalog WHERE id=?1",
+                    [&message],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            payload["timestamp"] = serde_json::json!(millis.to_string());
+            tx.execute(
+                "UPDATE catalog SET payload=?1 WHERE id=?2",
+                rusqlite::params![serde_json::to_vec(&payload).unwrap(), message],
+            )
+            .unwrap();
+            for (path, _, bytes, _) in &new_evidence {
+                let mut payload: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                payload["timestamp"] = serde_json::json!(millis.to_string());
+                tx.execute("UPDATE source_entity_projections SET payload=?1 WHERE source_path=?2 AND entity_id=?3",
+                    rusqlite::params![serde_json::to_vec(&payload).unwrap(), path, message]).unwrap();
+            }
+            assert_eq!(
+                tx.execute("UPDATE source_scans SET parser_version=4", [])
+                    .unwrap(),
+                2
+            );
+            tx.commit().unwrap();
+        }
+        let legacy_evidence = observations();
+        let upgraded = sync(first);
+        assert_eq!(
+            upgraded["data"]["generation"].as_u64().unwrap(),
+            initial["data"]["generation"].as_u64().unwrap() + 1
+        );
+        let mixed = observations();
+        assert_eq!(mixed[first], new_evidence[first]);
+        assert_eq!(
+            mixed[second], legacy_evidence[second],
+            "unscanned raw evidence must not be rewritten"
+        );
+        let got = run(&db, &["get", &message]);
+        assert!(got.status.success(), "{}", stdout(&got));
+        let payload: serde_json::Value =
+            serde_json::from_str(parse_first_line(&got)["data"]["payload"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(payload["timestamp"], canonical);
+        let search = run(
+            &db,
+            &[
+                "search",
+                "rollingepochneedle",
+                "--provider",
+                "cursor",
+                "--since",
+                canonical,
+                "--until",
+                "2025-01-01T00:00:00.124Z",
+            ],
+        );
+        assert!(search.status.success(), "{}", stdout(&search));
+        assert_eq!(
+            parse_first_line(&search)["data"]["hits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            sync(first)["data"]["generation"],
+            upgraded["data"]["generation"]
+        );
+        let converged = sync(second);
+        assert_eq!(
+            converged["data"]["generation"].as_u64().unwrap(),
+            upgraded["data"]["generation"].as_u64().unwrap() + 1
+        );
+        assert_eq!(observations(), new_evidence);
+        for index in [0, 1] {
+            let repeated = sync(index);
+            assert_eq!(
+                repeated["data"]["generation"],
+                converged["data"]["generation"]
+            );
+            assert_eq!(repeated["data"]["committed"], 0);
+            assert_eq!(std::fs::read(&sources[index]).unwrap(), original);
+        }
+        let conn = Connection::open(&db).unwrap();
+        let (messages, claims, documents): (i64, i64, i64) = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM catalog WHERE id LIKE 'msg_v1_%'), COUNT(*), COUNT(DISTINCT document_id) FROM source_membership WHERE message_id=?1",
+            [&message], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!((messages, claims, documents), (1, 2, 1));
+        let current: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_scans WHERE parser_version=?1",
+                [i64::from(
+                    agent_session_grep_adapters_sqlite::PARSER_SEMANTIC_VERSION,
+                )],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, 2);
+        let schema: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema, 19);
+    }
+}
+
+#[test]
+fn source_projection_corrections_and_deleted_winner_converge() {
+    let (dir, db) = temp_db("source-projection-authority");
+    let a = dir.path().join("a.jsonl");
+    let b = dir.path().join("b.jsonl");
+    let message = "99222222-2222-4222-8222-222222222222";
+    let wire = format!("msg_v1_{message}");
+    let write_projection = |path: &Path, text: &str| {
+        let row = serde_json::json!({
+            "type": "user", "uuid": message, "parentUuid": null,
+            "sessionId": "99111111-1111-4111-8111-111111111111",
+            "timestamp": "2026-08-01T00:00:00Z",
+            "message": { "role": "user", "content": text }
+        });
+        std::fs::write(path, format!("{row}\n")).unwrap();
+    };
+    let sync = |path: &Path| {
+        let out = run(&db, &["sync", path.to_str().unwrap()]);
+        assert!(out.status.success(), "{}", stdout(&out));
+        parse_first_line(&out)
+    };
+    let read_text = || {
+        let out = run(&db, &["get", &wire]);
+        assert!(out.status.success(), "{}", stdout(&out));
+        let frame = parse_first_line(&out);
+        let payload: serde_json::Value =
+            serde_json::from_str(frame["data"]["payload"].as_str().unwrap()).unwrap();
+        payload["text"].as_str().unwrap().to_owned()
+    };
+    write_projection(&a, "obsoletepayload much longer historical text");
+    sync(&a);
+    write_projection(&a, "freshpayload");
+    sync(&a);
+    assert_eq!(read_text(), "freshpayload");
+    let old = parse_first_line(&run(&db, &["search", "obsoletepayload"]));
+    assert!(old["data"]["hits"].as_array().unwrap().is_empty());
+
+    let longer = "survivorpayload second source projection with a much longer body than the first";
+    write_projection(&b, longer);
+    sync(&b);
+    assert_eq!(read_text(), longer);
+    std::fs::write(&b, "").unwrap();
+    let deleted = sync(&b);
+    assert_eq!(read_text(), "freshpayload");
+    let old = parse_first_line(&run(&db, &["search", "survivorpayload"]));
+    assert!(old["data"]["hits"].as_array().unwrap().is_empty());
+    let repeated = sync(&a);
+    assert_eq!(
+        repeated["data"]["generation"],
+        deleted["data"]["generation"]
+    );
+}
+
+#[test]
 fn stale_index_projection_is_reported_refused_then_healed_by_sync_and_rebuild() {
     // 实测缺陷的端到端固化：由旧二进制建立的库（FTS 词元流是纯 bigram）在
     // 新二进制下中文查询静默 0 命中、ASCII 照常命中。修复后三条线都必须成立：
@@ -3213,13 +3584,120 @@ fn run_with_path(
     args_out: &Path,
     args: &[&str],
 ) -> Output {
+    run_resume_with_output(db, path, cwd_out, args_out, &["--robot"], args)
+}
+
+fn run_resume_with_output(
+    db: &str,
+    path: &std::ffi::OsStr,
+    cwd_out: &Path,
+    args_out: &Path,
+    output_flags: &[&str],
+    args: &[&str],
+) -> Output {
     let mut cmd = Command::new(BIN);
-    cmd.arg("--db").arg(db).arg("--robot").args(args);
+    cmd.arg("--db").arg(db).args(output_flags).args(args);
     cmd.env("PATH", path);
     cmd.env("RESUME_SMOKE_CWD_OUT", cwd_out);
     cmd.env("RESUME_SMOKE_ARGS_OUT", args_out);
     cmd.output()
         .expect("failed to spawn agent-session-grep binary")
+}
+
+#[test]
+fn boundary_machine_resume_yes_never_spawns_or_acknowledges() {
+    let (dir, db) = temp_db("resume-machine-boundary");
+    let (fixture, anchor) = write_claude_resume_fixture(dir.path(), dir.path().to_str().unwrap());
+    let out = run(&db, &["ingest", &fixture]);
+    assert!(out.status.success(), "{}", stdout(&out));
+    let session = session_wire_for_message(&db, &anchor);
+    let fake_dir = dir.path().join("fake-bin");
+    std::fs::create_dir_all(&fake_dir).unwrap();
+    write_fake_provider(&fake_dir);
+    let cwd_out = dir.path().join("spawn-cwd.txt");
+    let args_out = dir.path().join("spawn-args.txt");
+    let marker = dir.path().join(".agent-session-grep-resume-ack");
+    let request_id = "sk_live_abcdef1234567890xyz";
+    for acknowledged in [false, true] {
+        if acknowledged {
+            let out = run(&db, &["resume", &session]);
+            assert!(out.status.success(), "{}", stdout(&out));
+            assert_eq!(parse_first_line(&out)["data"]["executed"], false);
+        }
+        for flags in [
+            vec!["--robot"],
+            vec!["--output", "json"],
+            vec!["--output", "jsonl"],
+        ] {
+            let mut flags = flags;
+            flags.extend(["--request-id", request_id]);
+            let out = run_resume_with_output(
+                &db,
+                fake_dir.as_os_str(),
+                &cwd_out,
+                &args_out,
+                &flags,
+                &["resume", &session, "--yes"],
+            );
+            assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+            let frame = parse_first_line(&out);
+            assert_envelope_shape(&frame, false);
+            assert_eq!(frame["error"]["code"], "invalid_request");
+            assert_eq!(frame["request_id"], request_id);
+            assert_eq!(stdout(&out).lines().count(), 1);
+            assert!(out.stderr.is_empty());
+            assert!(
+                !cwd_out.exists() && !args_out.exists(),
+                "machine mode spawned"
+            );
+            assert_eq!(
+                marker.exists(),
+                acknowledged,
+                "machine refusal changed acknowledgement"
+            );
+        }
+    }
+}
+
+#[test]
+fn boundary_option_like_native_ids_never_spawn_even_after_acknowledgement() {
+    for native in ["--dangerously-skip-permissions", "--", "-h"] {
+        let (dir, db) = temp_db("resume-native-boundary");
+        let (fixture, anchor) =
+            write_claude_resume_fixture(dir.path(), dir.path().to_str().unwrap());
+        let body = std::fs::read_to_string(&fixture)
+            .unwrap()
+            .replace("ccdd1234-5678-4abc-8def-001122334455", native);
+        std::fs::write(&fixture, body).unwrap();
+        let out = run(&db, &["ingest", &fixture]);
+        assert!(out.status.success(), "{}", stdout(&out));
+        let session = session_wire_for_message(&db, &anchor);
+        let preview = run(&db, &["resume", &session]);
+        let fake_dir = dir.path().join("fake-bin");
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        write_fake_provider(&fake_dir);
+        let cwd_out = dir.path().join("spawn-cwd.txt");
+        let args_out = dir.path().join("spawn-args.txt");
+        agent_session_grep_application::resume::acknowledge_resume_preview(dir.path()).unwrap();
+        let out = run_resume_with_output(
+            &db,
+            fake_dir.as_os_str(),
+            &cwd_out,
+            &args_out,
+            &[],
+            &["resume", &session, "--yes"],
+        );
+        assert!(out.status.success(), "{}", stdout(&out));
+        assert!(
+            !cwd_out.exists() && !args_out.exists(),
+            "option-like native id spawned: {native}"
+        );
+        let frame = parse_first_line(&preview);
+        assert_eq!(frame["data"]["available"], false);
+        assert!(frame["data"]["command"].is_null());
+        assert_eq!(frame["data"]["executed"], false);
+        assert!(!stdout(&preview).contains(native));
+    }
 }
 
 #[test]
@@ -3256,11 +3734,12 @@ fn resume_yes_first_run_forced_preview_then_spawns_in_original_cwd() {
         .unwrap_or_else(|| fake_dir.clone().into_os_string());
 
     // 1) 首次 resume --yes：强制预览不执行（持久标记缺失），落标记。
-    let out = run_with_path(
+    let out = run_resume_with_output(
         &db,
         &path,
         &cwd_out,
         &args_out,
+        &[],
         &["resume", &session_wire, "--yes"],
     );
     assert!(
@@ -3268,20 +3747,19 @@ fn resume_yes_first_run_forced_preview_then_spawns_in_original_cwd() {
         "first resume failed: {}",
         stdout(&out)
     );
-    let frame = parse_first_line(&out);
-    assert_envelope_shape(&frame, true);
-    assert_eq!(frame["data"]["executed"], false, "{frame}");
-    assert_eq!(frame["data"]["first_run_preview"], true, "{frame}");
-    assert_eq!(frame["data"]["permission_mode_verified"], false, "{frame}");
+    assert!(!stdout(&out).trim_start().starts_with('{'));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("首次使用 resume"));
+    assert!(dir.path().join(".agent-session-grep-resume-ack").exists());
     assert!(!cwd_out.exists(), "first run must not spawn provider");
     assert!(!args_out.exists(), "first run must not spawn provider");
 
     // 2) 第二次 resume --yes：标记已确认，真实 spawn 到原 cwd 并传正确参数。
-    let out = run_with_path(
+    let out = run_resume_with_output(
         &db,
         &path,
         &cwd_out,
         &args_out,
+        &[],
         &["resume", &session_wire, "--yes"],
     );
     assert!(
@@ -3289,13 +3767,8 @@ fn resume_yes_first_run_forced_preview_then_spawns_in_original_cwd() {
         "second resume failed: {}",
         stdout(&out)
     );
-    let frame = parse_first_line(&out);
-    assert_envelope_shape(&frame, true);
-    assert_eq!(frame["data"]["executed"], true, "{frame}");
-    assert!(
-        frame["data"].get("first_run_preview").is_none(),
-        "second run must not report first-run: {frame}"
-    );
+    assert!(!stdout(&out).trim_start().starts_with('{'));
+    assert!(out.stderr.is_empty());
     let recorded_cwd = std::fs::read_to_string(&cwd_out).expect("read recorded cwd");
     assert_eq!(
         std::fs::canonicalize(&recorded_cwd).expect("resolve spawned cwd"),
@@ -3315,13 +3788,14 @@ fn resume_yes_first_run_forced_preview_then_spawns_in_original_cwd() {
     let frame = parse_first_line(&out);
     assert_envelope_shape(&frame, true);
     assert_eq!(frame["data"]["executed"], false, "{frame}");
+    assert_eq!(frame["data"]["permission_mode_verified"], false, "{frame}");
     let command = frame["data"]["command"].as_str().expect("command string");
     assert!(command.contains("claude --resume"), "command {command}");
     assert!(command.contains(&workdir_str), "command {command}");
 }
 
 #[test]
-fn resume_yes_missing_provider_binary_returns_structured_error() {
+fn resume_yes_missing_provider_binary_returns_human_error() {
     let (dir, db) = temp_db("resume-missing-bin");
     let cwd_str = dir.path().to_string_lossy().into_owned();
     let (fixture_path, anchor_message) = write_claude_resume_fixture(dir.path(), &cwd_str);
@@ -3335,13 +3809,13 @@ fn resume_yes_missing_provider_binary_returns_structured_error() {
     let cwd_out = dir.path().join("never-cwd.txt");
     let args_out = dir.path().join("never-args.txt");
 
-    // 首次 resume --yes：强制预览 + 落标记（不触发 preflight）。
+    // Machine preview acknowledges without execution or binary preflight.
     let out = run_with_path(
         &db,
         empty_bin.as_os_str(),
         &cwd_out,
         &args_out,
-        &["resume", &session_wire, "--yes"],
+        &["resume", &session_wire],
     );
     assert!(
         out.status.success(),
@@ -3353,11 +3827,12 @@ fn resume_yes_missing_provider_binary_returns_structured_error() {
     assert!(!cwd_out.exists(), "first run must not spawn");
 
     // 第二次 --yes：preflight 拦截缺失二进制 → 结构化 provider_error（exit 7）。
-    let out = run_with_path(
+    let out = run_resume_with_output(
         &db,
         empty_bin.as_os_str(),
         &cwd_out,
         &args_out,
+        &[],
         &["resume", &session_wire, "--yes"],
     );
     assert!(
@@ -3366,20 +3841,279 @@ fn resume_yes_missing_provider_binary_returns_structured_error() {
         stdout(&out)
     );
     assert_eq!(out.status.code(), Some(7), "provider_error exit code");
-    let frame = parse_first_line(&out);
-    assert_envelope_shape(&frame, false);
-    assert_eq!(frame["error"]["code"], "provider_error", "{frame}");
+    assert!(out.stdout.is_empty());
+    let diagnostic = String::from_utf8_lossy(&out.stderr);
+    assert!(diagnostic.contains("[provider_error]"), "{diagnostic}");
+    assert!(diagnostic.contains("install"), "{diagnostic}");
+    assert!(!cwd_out.exists() && !args_out.exists());
+}
+
+#[test]
+fn boundary_unknown_command_and_machine_errors_do_not_echo_secrets() {
+    let (_dir, db) = temp_db("error-text-boundary");
+    let secret = "sk_live_abcdef1234567890xyz";
+    for unknown in [secret, "C:/private/unknown-command"] {
+        let out = run(&db, &["--request-id", secret, unknown]);
+        assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+        let frame = parse_first_line(&out);
+        assert_eq!(frame["command"], "unknown");
+        assert_eq!(frame["request_id"], secret);
+        assert!(
+            !frame["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(unknown)
+        );
+    }
+    let out = run_human(&db, &["search", "--since", secret, "q"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let diagnostic = String::from_utf8_lossy(&out.stderr);
+    // Preserve the local Human diagnostic policy; the machine boundary redacts.
+    assert!(diagnostic.contains(secret), "{diagnostic}");
+    let machine = run(&db, &["search", "--since", secret, "q"]);
+    let frame = parse_first_line(&machine);
+    assert_eq!(machine.status.code(), Some(2));
+    assert!(!frame["error"]["message"].as_str().unwrap().contains(secret));
+}
+
+#[test]
+fn semantic_readiness_matches_model_dimension_and_live_messages() {
+    use agent_session_grep_application::embedding::{BIGRAM_HASH_DIMENSION, BIGRAM_HASH_MODEL_ID};
+
+    let (dir, db) = temp_db("vector-readiness");
+    let command = || {
+        let mut command = Command::new(BIN);
+        command
+            .args(["--db", &db, "--robot"])
+            .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
+            .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
+            .env("APPDATA", dir.path())
+            .env("LOCALAPPDATA", dir.path())
+            .env("XDG_CACHE_HOME", dir.path().join("cache"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"));
+        command
+    };
+    let source = dir.path().join("source.jsonl");
+    let native = "88222222-2222-4222-8222-222222222222";
+    let wire = format!("msg_v1_{native}");
+    std::fs::write(
+        &source,
+        serde_json::json!({
+            "type": "user", "uuid": native,
+            "sessionId": "88111111-1111-4111-8111-111111111111",
+            "message": {"role": "user", "content": "readinessneedle"}
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+    let out = command()
+        .args(["sync", source.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stdout(&out));
+    for (model, dimension, stored_wire) in [
+        (BIGRAM_HASH_MODEL_ID, 2usize, wire.as_str()),
+        (BIGRAM_HASH_MODEL_ID, BIGRAM_HASH_DIMENSION, "msg_v1_absent"),
+        (
+            "synthetic-other-model",
+            BIGRAM_HASH_DIMENSION,
+            wire.as_str(),
+        ),
+    ] {
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("DELETE FROM message_vec", []).unwrap();
+            conn.execute(
+                "INSERT INTO message_vec(wire_id, model_id, dimension, embedding) VALUES(?1, ?2, ?3, ?4)",
+                rusqlite::params![stored_wire, model, dimension as i64, vec![0u8; dimension * 4]],
+            ).unwrap();
+        }
+        for mode in ["semantic", "hybrid"] {
+            let out = command()
+                .args(["search", "--mode", mode, "readinessneedle"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", stdout(&out));
+            let frame = parse_first_line(&out);
+            assert_eq!(frame["retrieval_mode"], "lexical_fallback", "{frame}");
+            assert!(!frame["warnings"].as_array().unwrap().is_empty(), "{frame}");
+            assert_eq!(
+                frame["data"]["hits"].as_array().unwrap().len(),
+                1,
+                "{frame}"
+            );
+            assert_eq!(frame["data"]["hits"][0]["id"], wire, "{frame}");
+        }
+        let conn = Connection::open(&db).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message_vec", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "readiness/search must not prune stored vectors");
+    }
+    let out = command().args(["index", "embeddings"]).output().unwrap();
+    assert!(out.status.success(), "{}", stdout(&out));
+    for mode in ["semantic", "hybrid"] {
+        let out = command()
+            .args(["search", "--mode", mode, "readinessneedle"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", stdout(&out));
+        let frame = parse_first_line(&out);
+        assert_eq!(frame["retrieval_mode"], mode, "{frame}");
+        assert_eq!(
+            frame["data"]["hits"].as_array().unwrap().len(),
+            1,
+            "{frame}"
+        );
+    }
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO message_vec(wire_id, model_id, dimension, embedding) VALUES(?1, ?2, ?3, ?4)",
+            rusqlite::params!["msg_v1_absent", BIGRAM_HASH_MODEL_ID, BIGRAM_HASH_DIMENSION as i64, vec![0u8; BIGRAM_HASH_DIMENSION * 4]],
+        ).unwrap();
+    }
+    let out = command().args(["index", "rebuild"]).output().unwrap();
+    assert!(out.status.success(), "{}", stdout(&out));
+    let conn = Connection::open(&db).unwrap();
+    let ids: Vec<String> = conn
+        .prepare("SELECT wire_id FROM message_vec ORDER BY wire_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
     assert_eq!(
-        frame["error"]["details"]["stage"], "binary_preflight",
-        "{frame}"
+        ids,
+        vec![wire],
+        "explicit maintenance removes only historical orphans"
     );
-    assert_eq!(frame["error"]["details"]["binary"], "claude", "{frame}");
+}
+
+#[cfg(feature = "semantic-candle")]
+#[test]
+fn boundary_local_model_absence_failure_and_vector_readiness_are_distinct() {
+    let (dir, db) = temp_db("model-boundary");
+    let command = || {
+        let mut command = Command::new(BIN);
+        command
+            .args(["--db", &db, "--robot"])
+            .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
+            .env("APPDATA", dir.path())
+            .env("LOCALAPPDATA", dir.path())
+            .env("XDG_CACHE_HOME", dir.path().join("cache"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"));
+        command
+    };
+    let paths = command().args(["config", "paths"]).output().unwrap();
+    assert!(paths.status.success(), "{}", stdout(&paths));
+    let paths = parse_first_line(&paths);
+    let model_dir = agent_session_grep_application::candle_embedding::default_model_dir(Path::new(
+        paths["data"]["cache"].as_str().unwrap(),
+    ));
+    assert!(!model_dir.exists());
+    let source = dir.path().join("model-source.jsonl");
+    std::fs::write(
+        &source,
+        serde_json::json!({
+            "type": "user", "uuid": "model-message", "sessionId": "model-session",
+            "message": {"role": "user", "content": "hello"}
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+    let out = command()
+        .args(["ingest", source.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stdout(&out));
+    let out = command()
+        .args(["search", "--mode", "semantic", "hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stdout(&out));
+    let frame = parse_first_line(&out);
+    assert_eq!(frame["retrieval_mode"], "lexical_fallback");
+    assert!(!frame["warnings"].as_array().unwrap().is_empty());
+    let out = command().args(["index", "embeddings"]).output().unwrap();
+    assert!(out.status.success(), "{}", stdout(&out));
+    let out = command()
+        .args(["search", "--mode", "semantic", "hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stdout(&out));
+    assert_eq!(parse_first_line(&out)["retrieval_mode"], "semantic");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    for args in [
+        vec!["search", "--mode", "semantic", "hello"],
+        vec!["index", "embeddings"],
+    ] {
+        let out = command().args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(6), "{}", stdout(&out));
+        let frame = parse_first_line(&out);
+        assert_eq!(frame["error"]["code"], "catalog_error");
+        assert_eq!(frame["error"]["details"]["stage"], "model_load");
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("restart")
+        );
+        assert!(!stdout(&out).contains(model_dir.to_str().unwrap()));
+    }
+    let out = command().args(["search", "hello"]).output().unwrap();
     assert!(
-        frame["error"]["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("install")),
-        "error message must hint installation: {frame}"
+        out.status.success(),
+        "lexical search must remain usable: {}",
+        stdout(&out)
     );
+}
+
+#[test]
+fn boundary_diagnostic_redaction_preserves_human_and_reports_machine_status() {
+    let secret = "sk_live_abcdef1234567890xyz";
+    for command in ["ingest", "sync"] {
+        for human in [false, true] {
+            let (dir, db) = temp_db("diagnostic-redaction-status");
+            let source = dir.path().join("sessions.jsonl");
+            let valid = serde_json::json!({
+                "type": "user", "uuid": "synthetic-message",
+                "sessionId": "synthetic-session",
+                "message": {"role": "user", "content": "synthetic diagnostic fixture"}
+            });
+            let invalid = serde_json::json!({"type": "user", "message": secret});
+            std::fs::write(&source, format!("{valid}\n{invalid}\n")).unwrap();
+            let args = [command, source.to_str().unwrap()];
+            let out = if human {
+                run_human(&db, &args)
+            } else {
+                run(&db, &args)
+            };
+            assert!(out.status.success(), "{}", stdout(&out));
+            if human {
+                let diagnostic = String::from_utf8_lossy(&out.stderr);
+                assert!(diagnostic.contains(secret), "{diagnostic}");
+                assert!(!diagnostic.contains("[redacted:"), "{diagnostic}");
+            } else {
+                let frame = parse_first_line(&out);
+                assert!(!stdout(&out).contains(secret), "{frame}");
+                assert!(
+                    frame["warnings"]
+                        .to_string()
+                        .contains("[redacted:stripe_key]")
+                );
+                assert_eq!(frame["redaction"]["status"], "applied", "{frame}");
+                assert_eq!(frame["redaction"]["redacted_count"], 1, "{frame}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -4796,14 +5530,14 @@ fn doctor_and_config_reject_unknown_tokens() {
 }
 
 #[test]
-fn error_envelope_command_points_at_the_failing_token() {
-    // R8.4：未知 `-` 开头 token 是命令名笔误，envelope 的 `command` 指向它，
+fn error_envelope_normalizes_the_failing_unknown_token() {
+    // R8.4：未知 `-` 开头 token 是命令名笔误，envelope 使用安全的 unknown，
     // 而不是后面的真命令。
     let out = run_bare(&["--bogus", "--robot", "status"]);
     assert_eq!(out.status.code(), Some(2), "stdout={}", stdout(&out));
     let frame = parse_first_line(&out);
     assert_envelope_shape(&frame, false);
-    assert_eq!(frame["command"], "--bogus", "{frame}");
+    assert_eq!(frame["command"], "unknown", "{frame}");
 }
 
 #[test]

@@ -921,9 +921,9 @@ fn search_query_digest(
         hasher.finalize().to_hex().to_string()
     });
     // Structured encoding prevents delimiter collisions in untrusted strings.
-    // v2 intentionally rejects old cursors whose ranking state was unbound.
+    // Reject cursors issued before ranking used the adapter-matched owner.
     cursor::digest_query(&serde_json::json!({
-        "version": "search-v2-rrf60-signals-v2-clock",
+        "version": "search-v2-rrf60-signals-v3-matched-owner",
         "result_set": "search",
         "query": query,
         "providers": filters.providers.iter().map(|provider| provider.as_str()).collect::<Vec<_>>(),
@@ -1695,6 +1695,10 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
     /// 执行一个应用请求。校验错误保持 Domain 分类，端口错误保持 Port 分类，
     /// cursor/budget 错误保持各自分类（protocol 层有专属 canonical code）。
     pub fn handle(&self, req: AppRequest) -> Result<AppResponse, AppError> {
+        // Every AppRequest is read-only. All data ports must share the catalog's
+        // backend session; outer composition may keep a nested guard for its
+        // additional evidence/display reads after this response is assembled.
+        let _snapshot = self.catalog.begin_read_snapshot()?;
         match req {
             AppRequest::Search {
                 query,
@@ -1722,9 +1726,10 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                     )
                     .into());
                 }
-                let semantic_ready = mode != RetrievalMode::Lexical
-                    && self.semantic.is_ready()?
-                    && query_embedding.is_some();
+                let semantic_ready = match (mode, query_embedding.as_ref()) {
+                    (RetrievalMode::Lexical, _) | (_, None) => false,
+                    (_, Some(embedding)) => self.semantic.is_ready(embedding.len())?,
+                };
                 let response_mode = if mode == RetrievalMode::Lexical || semantic_ready {
                     mode
                 } else {
@@ -1738,7 +1743,9 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                     } else {
                         self.semantic.semantic_model_id()?
                     },
-                    embedding: if semantic_ready {
+                    // Fallback changes the execution path, not the identity
+                    // of the requested query vector used by cursor validation.
+                    embedding: if mode != RetrievalMode::Lexical {
                         query_embedding.as_deref()
                     } else {
                         None
@@ -1957,7 +1964,15 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                             let sessions = self.catalog.session_of(&scanned_ids)?;
                             let session_ids: Vec<StableId> = sessions
                                 .iter()
-                                .map(|(_message_id, session)| session.clone())
+                                .zip(&scanned)
+                                .map(|((_message_id, session), hit)| {
+                                    // Match display ownership: only legacy hits
+                                    // without an owner use the unfiltered lookup.
+                                    match hit.session_id.as_deref() {
+                                        Some(owner) => StableId::from_wire(owner),
+                                        None => session.clone(),
+                                    }
+                                })
                                 .map(|session| {
                                     session.unwrap_or_else(|| {
                                         StableId::native(
@@ -2580,9 +2595,7 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                     .iter()
                     .filter_map(|m| StableId::from_wire(&m.message_id))
                     .collect();
-                self.catalog
-                    .tool_activities_for_messages(&ids)
-                    .unwrap_or_default()
+                self.catalog.tool_activities_for_messages(&ids)?
             },
             messages,
             evidence,
@@ -3452,7 +3465,7 @@ mod tests {
                 })
                 .collect())
         }
-        fn is_ready(&self) -> PortResult<bool> {
+        fn is_ready(&self, _query_dimension: usize) -> PortResult<bool> {
             Ok(true)
         }
         fn semantic_model_id(&self) -> PortResult<Option<String>> {
@@ -3467,6 +3480,7 @@ mod tests {
         generation: std::cell::Cell<u64>,
         session_of: std::collections::BTreeMap<String, String>,
         titles: std::collections::BTreeMap<String, String>,
+        repo_slugs: std::collections::BTreeMap<String, String>,
     }
     impl MapCatalog {
         fn new(generation: u64) -> Self {
@@ -3475,6 +3489,7 @@ mod tests {
                 generation: std::cell::Cell::new(generation),
                 session_of: Default::default(),
                 titles: Default::default(),
+                repo_slugs: Default::default(),
             }
         }
         fn insert(&mut self, id: &StableId, payload: impl Into<Vec<u8>>) {
@@ -3535,6 +3550,12 @@ mod tests {
             Ok(session_ids
                 .iter()
                 .map(|id| self.titles.get(id.as_str()).cloned())
+                .collect())
+        }
+        fn session_repo_slugs(&self, session_ids: &[StableId]) -> PortResult<Vec<Option<String>>> {
+            Ok(session_ids
+                .iter()
+                .map(|id| self.repo_slugs.get(id.as_str()).cloned())
                 .collect())
         }
         fn count(&self) -> PortResult<u64> {
@@ -3836,6 +3857,7 @@ mod tests {
         model: std::cell::RefCell<String>,
         fail: std::cell::Cell<bool>,
         nonfinite: std::cell::Cell<bool>,
+        readiness_dimensions: std::cell::RefCell<Vec<usize>>,
     }
     impl SemanticIndex for MutableSemantic {
         fn index_embedding(&self, _id: &StableId, _embedding: &[f32]) -> PortResult<()> {
@@ -3861,11 +3883,12 @@ mod tests {
             }
             Ok(hits)
         }
-        fn is_ready(&self) -> PortResult<bool> {
+        fn is_ready(&self, query_dimension: usize) -> PortResult<bool> {
+            self.readiness_dimensions.borrow_mut().push(query_dimension);
             if self.fail.get() {
                 Err(PortError::Backend("synthetic readiness failure".into()))
             } else {
-                Ok(self.ready.get())
+                Ok(self.ready.get() && query_dimension == 8)
             }
         }
         fn semantic_model_id(&self) -> PortResult<Option<String>> {
@@ -3892,9 +3915,73 @@ mod tests {
                 model: std::cell::RefCell::new("model-a".into()),
                 fail: std::cell::Cell::new(false),
                 nonfinite: std::cell::Cell::new(false),
+                readiness_dimensions: std::cell::RefCell::new(Vec::new()),
             },
             clock_t0,
         )
+    }
+
+    #[test]
+    fn semantic_missing_query_embedding_falls_back_without_readiness_probe() {
+        let app = mutable_semantic_app();
+        app.semantic.fail.set(true);
+        for mode in [RetrievalMode::Semantic, RetrievalMode::Hybrid] {
+            let mut request = semantic_req("needle", 10, None);
+            if let AppRequest::Search {
+                query_embedding,
+                mode: requested_mode,
+                ..
+            } = &mut request
+            {
+                *query_embedding = None;
+                *requested_mode = mode;
+            }
+            let AppResponse::Search {
+                hits,
+                retrieval_mode,
+                fallback_warning,
+                ..
+            } = app.handle(request).unwrap()
+            else {
+                panic!("search response")
+            };
+            assert_eq!(retrieval_mode, RetrievalMode::LexicalFallback);
+            assert!(fallback_warning.is_some());
+            assert_eq!(hits.len(), 3);
+        }
+        assert!(app.semantic.readiness_dimensions.borrow().is_empty());
+    }
+
+    #[test]
+    fn semantic_readiness_probes_the_query_dimension_once_per_request() {
+        let app = mutable_semantic_app();
+        for dimension in [8, 17] {
+            let mut request = semantic_req("needle", 10, None);
+            if let AppRequest::Search {
+                query_embedding, ..
+            } = &mut request
+            {
+                *query_embedding = Some(vec![1.0; dimension]);
+            }
+            let AppResponse::Search {
+                retrieval_mode,
+                fallback_warning,
+                ..
+            } = app.handle(request).unwrap()
+            else {
+                panic!("search response")
+            };
+            assert_eq!(
+                retrieval_mode,
+                if dimension == 8 {
+                    RetrievalMode::Semantic
+                } else {
+                    RetrievalMode::LexicalFallback
+                }
+            );
+            assert_eq!(fallback_warning.is_some(), dimension != 8);
+        }
+        assert_eq!(*app.semantic.readiness_dimensions.borrow(), [8, 17]);
     }
 
     #[test]
@@ -3982,6 +4069,54 @@ mod tests {
             app.handle(semantic_req("needle", 1, Some(token))),
             Err(AppError::Cursor(_))
         ));
+    }
+
+    #[test]
+    fn semantic_fallback_cursor_binds_requested_vector_dimension_and_content() {
+        for mode in [RetrievalMode::Semantic, RetrievalMode::Hybrid] {
+            let app = mutable_semantic_app();
+            let request = |embedding: Vec<f32>, token: Option<String>| {
+                let mut request = semantic_req("needle", 1, token);
+                if let AppRequest::Search {
+                    query_embedding,
+                    mode: requested_mode,
+                    ..
+                } = &mut request
+                {
+                    *query_embedding = Some(embedding);
+                    *requested_mode = mode;
+                }
+                request
+            };
+            let (first, token, _, _) = hits_of(app.handle(request(vec![1.0; 17], None)).unwrap());
+            let token = token.expect("fallback must retain paging");
+            let same = app
+                .handle(request(vec![1.0; 17], Some(token.clone())))
+                .unwrap();
+            assert!(matches!(
+                &same,
+                AppResponse::Search {
+                    retrieval_mode: RetrievalMode::LexicalFallback,
+                    ..
+                }
+            ));
+            let (second, _, _, _) = hits_of(same);
+            assert_eq!(first.len(), 1);
+            assert_eq!(second.len(), 1);
+            assert_ne!(
+                first, second,
+                "unchanged fallback input must continue the page"
+            );
+            for changed in [vec![1.0; 18], vec![0.5; 17]] {
+                assert!(
+                    matches!(
+                        app.handle(request(changed, Some(token.clone()))),
+                        Err(AppError::Cursor(cursor::CursorError::Invalid(_)))
+                    ),
+                    "fallback cursor must bind the requested dimension and vector"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4403,6 +4538,108 @@ mod tests {
                 Err(AppError::Cursor(cursor::CursorError::Expired(_)))
             ));
         }
+    }
+
+    fn assert_current_repo_owner(matched_owner: bool) {
+        struct OwnerIndex {
+            hits: ScoredHits,
+            owner: Option<String>,
+        }
+        impl SearchIndex for OwnerIndex {
+            fn index(&self, _id: &StableId, _text: &str) -> PortResult<()> {
+                Ok(())
+            }
+            fn query_filtered(
+                &self,
+                query: SearchQuery<'_>,
+                limit: usize,
+            ) -> PortResult<Vec<SearchHit>> {
+                assert_eq!(query.filters.repo.as_deref(), Some("repo-b"));
+                let mut hits = self.hits.query_filtered(query, limit)?;
+                hits[0].session_id = self.owner.clone();
+                Ok(hits)
+            }
+        }
+        let shared = StableId::native(IdKind::Message, "shared-owner");
+        let a = StableId::native(IdKind::Session, "owner-a");
+        let b = StableId::native(IdKind::Session, "owner-b");
+        let mut cat = MapCatalog::new(7);
+        // A is the unfiltered owner; the adapter selects B for this repo filter.
+        cat.set_session_of(&shared, &a);
+        cat.repo_slugs.insert(a.as_str().into(), "repo-a".into());
+        cat.repo_slugs.insert(b.as_str().into(), "repo-b".into());
+        cat.insert(&shared, br#"{"text":"needle"}"#.to_vec());
+        for current in ["repo-a", "repo-b"] {
+            let app = App::with_clock(
+                &cat,
+                OwnerIndex {
+                    hits: ScoredHits(vec![(shared.clone(), 1.0)]),
+                    owner: matched_owner.then(|| b.as_str().to_string()),
+                },
+                rank_clock,
+            )
+            .with_current_repo(Some(current.into()));
+            let mut request = search_req("needle", 10, None);
+            let AppRequest::Search { filters, .. } = &mut request else {
+                unreachable!()
+            };
+            filters.repo = Some("repo-b".into());
+            let AppResponse::Search { hits, .. } = app.handle(request).unwrap() else {
+                panic!("expected Search response");
+            };
+            assert_eq!(hits.len(), 1);
+            let owner = if matched_owner { &b } else { &a };
+            assert_eq!(hits[0].session_id.as_deref(), Some(owner.as_str()));
+            let boosted = current == if matched_owner { "repo-b" } else { "repo-a" };
+            assert_eq!(hits[0].score, ranking::final_score(1.0, 0, false, boosted));
+        }
+    }
+
+    #[test]
+    fn search_current_repo_uses_filtered_shared_message_owner() {
+        assert_current_repo_owner(true);
+    }
+
+    #[test]
+    fn search_current_repo_preserves_legacy_missing_owner_fallback() {
+        assert_current_repo_owner(false);
+    }
+
+    #[test]
+    fn search_current_repo_rejects_pre_owner_fix_cursor() {
+        // Exact pre-fix binding: no data or request change can invalidate this
+        // cursor unless the owner-selection ranking revision is also bound.
+        let legacy_digest = cursor::digest_query(
+            &serde_json::json!({
+                "version": "search-v2-rrf60-signals-v2-clock",
+                "result_set": "search", "query": "needle", "providers": [],
+                "since": null, "until": null, "repo": null,
+                "facets": { "sidechain": "include", "tool_kind": null, "tool_name": null },
+                "include_system": false, "group_by_session": false,
+                "current_repo": "repo-b", "requested_mode": "lexical",
+                "effective_mode": "lexical", "model": null, "dimension": null,
+                "embedding": null, "rank_window": RANK_SCAN_WINDOW,
+                "group_factor": GROUP_SCAN_FACTOR,
+            })
+            .to_string(),
+        );
+        let token = cursor::issue(&cursor::CursorClaims {
+            contract_major: cursor::SUPPORTED_CONTRACT_MAJOR,
+            generation: 7,
+            issued_at_ms: rank_clock(),
+            expires_at_ms: rank_clock() + cursor::DEFAULT_TTL_MS,
+            query_digest: legacy_digest,
+            sort_digest: SORT_SCORE_DESC.into(),
+            result_set: None,
+            offset: 1,
+        })
+        .into_string();
+        let app = App::with_clock(MapCatalog::new(7), ScoredHits(vec![]), rank_clock)
+            .with_current_repo(Some("repo-b".into()));
+        assert!(matches!(
+            app.handle(search_req("needle", 10, Some(token))),
+            Err(AppError::Cursor(cursor::CursorError::Invalid(_)))
+        ));
     }
 
     #[test]
@@ -5640,6 +5877,7 @@ mod tests {
         context_message_id: StableId,
         candidates: Vec<PortMessageContextCandidate>,
         stats: ContextStats,
+        activity_read: fn(&[StableId]) -> PortResult<Vec<serde_json::Value>>,
     }
 
     impl CatalogStore for GraphCatalog {
@@ -5751,6 +5989,13 @@ mod tests {
 
         fn context_stats(&self) -> PortResult<ContextStats> {
             Ok(self.stats)
+        }
+
+        fn tool_activities_for_messages(
+            &self,
+            message_ids: &[StableId],
+        ) -> PortResult<Vec<serde_json::Value>> {
+            (self.activity_read)(message_ids)
         }
     }
 
@@ -5919,6 +6164,7 @@ mod tests {
         let store = GraphCatalog {
             catalog,
             graph,
+            activity_read: |ids| FakeCatalog.tool_activities_for_messages(ids),
             context_message_id: repeated.clone(),
             candidates: vec![
                 PortMessageContextCandidate {
@@ -5972,6 +6218,100 @@ mod tests {
             level,
             budget,
         }
+    }
+
+    #[test]
+    fn context_activity_read_errors_propagate() {
+        for empty_graph in [false, true] {
+            let mut fixture = ctx_fixture();
+            fixture.store.activity_read =
+                |_| Err(PortError::Backend("activity read failed".into()));
+            if empty_graph {
+                fixture.store.graph.messages.clear();
+                fixture.store.graph.placements.clear();
+                fixture.store.graph.edges.clear();
+            }
+            for policy in [ContextPolicy::Mainline, ContextPolicy::Full] {
+                for level in [
+                    ContextLevel::Raw,
+                    ContextLevel::Talks,
+                    ContextLevel::Sessions,
+                ] {
+                    let err = app_ctx(&fixture.store)
+                        .handle(ctx_req_level(
+                            &fixture.session,
+                            policy,
+                            level,
+                            ResponseBudget::default(),
+                        ))
+                        .unwrap_err();
+                    assert!(
+                        matches!(err, AppError::Port(PortError::Backend(ref message))
+                            if message == "activity read failed"),
+                        "{err:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn context_activity_missing_projection_remains_empty_success() {
+        for empty_graph in [false, true] {
+            let mut fixture = ctx_fixture();
+            if empty_graph {
+                fixture.store.graph.messages.clear();
+                fixture.store.graph.placements.clear();
+                fixture.store.graph.edges.clear();
+            }
+            for policy in [ContextPolicy::Mainline, ContextPolicy::Full] {
+                let response = app_ctx(&fixture.store)
+                    .handle(ctx_req(&fixture.session, policy, ResponseBudget::default()))
+                    .unwrap();
+                let AppResponse::Context {
+                    tool_activities,
+                    messages,
+                    ..
+                } = response
+                else {
+                    panic!("expected Context response");
+                };
+                assert!(tool_activities.is_empty());
+                assert_eq!(messages.is_empty(), empty_graph);
+            }
+        }
+    }
+
+    #[test]
+    fn context_activity_read_uses_retained_messages() {
+        let mut fixture = ctx_fixture();
+        fixture.store.activity_read = |ids| {
+            assert_eq!(ids.len(), 1);
+            Ok(vec![serde_json::json!({ "message_id": ids[0].as_str() })])
+        };
+        let response = app_ctx(&fixture.store)
+            .handle(ctx_req(
+                &fixture.session,
+                ContextPolicy::Mainline,
+                ResponseBudget {
+                    max_messages: 1,
+                    ..ResponseBudget::default()
+                },
+            ))
+            .unwrap();
+        let AppResponse::Context {
+            tool_activities,
+            messages,
+            ..
+        } = response
+        else {
+            panic!("expected Context response");
+        };
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            tool_activities,
+            vec![serde_json::json!({ "message_id": messages[0].message_id })]
+        );
     }
 
     #[test]

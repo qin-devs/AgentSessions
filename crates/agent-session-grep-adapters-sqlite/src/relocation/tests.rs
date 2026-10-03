@@ -14,7 +14,8 @@ const NOW_MS: i64 = 1_700_000_000_000;
 const TTL_DAYS: u32 = 90;
 // Independent of the implementation inventory: adding a live source locator
 // table must update the regression contract as well as the migration itself.
-const EXPECTED_LOCATOR_TABLES: [&str; 8] = [
+const EXPECTED_LOCATOR_TABLES: [&str; 9] = [
+    "source_entity_projections",
     "source_installations",
     "source_membership",
     "source_placement_membership",

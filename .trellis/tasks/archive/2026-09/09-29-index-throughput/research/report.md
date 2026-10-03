@@ -123,14 +123,14 @@ env 门控 trace（`ASG_INDEX_TRACE`，默认关闭，见 `crates/*/src/trace.rs
 ```powershell
 # 基线（c2d58e8 参考 worktree 构建的磁盘二进制 664c2e7b…；封存 A/B 所用 47e3c6a0… 二进制已不在磁盘）
 python -B .trellis/tasks/09-29-index-throughput/research/harness/baseline.py run `
-  --workspace C:/AgentSessions-worktrees/index-throughput-baseline `
-  --binary C:/AgentSessions-worktrees/post-reuse-phase/target/index-throughput/baseline-target/release/agent-session-grep.exe `
+  --workspace <baseline-repo> `
+  --binary <repo>/target/index-throughput/baseline-target/release/agent-session-grep.exe `
   --scratch-dir <fresh> --output-dir <fresh> --environment <harness>/environment.json `
   --profile full --scales 1000000 --expected-commit c2d58e862b4fe0320240f8a40eefef09d958ff55
 
 # 优化后（主 worktree，提交见 §4）
 python -B .trellis/tasks/09-29-index-throughput/research/harness/baseline.py run `
-  --workspace C:/AgentSessions-worktrees/post-reuse-phase `
+  --workspace <repo> `
   --binary target/release/agent-session-grep.exe --scratch-dir <fresh> --output-dir <fresh> `
   --environment <harness>/environment.json --profile full --scales 1000000 --expected-commit <HEAD>
 
